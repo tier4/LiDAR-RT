@@ -34,25 +34,32 @@ def _pointcloud_to_range_image(xyzs, intensities, H, W, inc_bottom, inc_top, max
     x, y, z = xyzs[:, 0], xyzs[:, 1], xyzs[:, 2]
     dists = np.linalg.norm(xyzs, axis=1)
 
-    range_map = np.ones((H, W)) * -1
-    intensity_map = np.ones((H, W)) * -1
+    # Vectorized filtering
+    valid = (dists <= max_depth) & (dists >= 0.1)
+    x, y, z, dists = x[valid], y[valid], z[valid], dists[valid]
+    valid_intensities = intensities[valid]
 
-    for i in range(len(xyzs)):
-        if dists[i] > max_depth or dists[i] < 0.1:
-            continue
+    # Vectorized projection
+    azimuth = np.arctan2(y, x)
+    inclination = np.arctan2(z, np.sqrt(x ** 2 + y ** 2))
 
-        azimuth = np.arctan2(y[i], x[i])
-        inclination = np.arctan2(z[i], np.sqrt(x[i] ** 2 + y[i] ** 2))
+    w_idx = np.round((azimuth - azimuth_left) / h_res).astype(np.int32)
+    h_idx = np.round((inclination - inc_top) / v_res).astype(np.int32)
 
-        w_idx = int(np.round((azimuth - azimuth_left) / h_res))
-        h_idx = int(np.round((inclination - inc_top) / v_res))
+    # Bounds filtering
+    in_bounds = (w_idx >= 0) & (w_idx < W) & (h_idx >= 0) & (h_idx < H)
+    w_idx, h_idx = w_idx[in_bounds], h_idx[in_bounds]
+    dists, valid_intensities = dists[in_bounds], valid_intensities[in_bounds]
 
-        if w_idx < 0 or w_idx >= W or h_idx < 0 or h_idx >= H:
-            continue
+    # Sort by distance (descending) so closer points overwrite farther ones
+    order = np.argsort(-dists)
+    w_idx, h_idx = w_idx[order], h_idx[order]
+    dists, valid_intensities = dists[order], valid_intensities[order]
 
-        if range_map[h_idx, w_idx] == -1 or range_map[h_idx, w_idx] > dists[i]:
-            range_map[h_idx, w_idx] = dists[i]
-            intensity_map[h_idx, w_idx] = intensities[i]
+    range_map = np.zeros((H, W), dtype=np.float64)
+    intensity_map = np.zeros((H, W), dtype=np.float64)
+    range_map[h_idx, w_idx] = dists
+    intensity_map[h_idx, w_idx] = valid_intensities
 
     range_image = np.stack([range_map, intensity_map], axis=-1)
     return range_image
@@ -125,14 +132,15 @@ def load_t4_raw(base_dir, args):
     # Configuration
     lidar_channel = getattr(args, "lidar_channel", "LIDAR_TOP")
     topic_mapping = getattr(args, "topic_mapping", None)
+    use_rosbag = getattr(args, "use_rosbag", False)
     W = getattr(args, "range_image_width", 1024)
     H = getattr(args, "range_image_height", 64)
     inc_bottom = math.radians(getattr(args, "inc_bottom", -25.0))
     inc_top = math.radians(getattr(args, "inc_top", 15.0))
     max_depth = getattr(args, "max_depth", 120.0)
 
-    # Initialize T4Devkit with rosbag support for per-sensor data
-    t4 = T4Devkit(base_dir, use_rosbag=True, topic_mapping=topic_mapping)
+    # Initialize T4Devkit
+    t4 = T4Devkit(base_dir, use_rosbag=use_rosbag, topic_mapping=topic_mapping)
 
     # Get sensor calibration (sensor2ego)
     sensor2ego = _get_sensor2ego(t4, lidar_channel)
