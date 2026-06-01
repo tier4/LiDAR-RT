@@ -190,6 +190,13 @@ def main():
                     name="3D World (GT + Rendered)",
                     origin="world",
                     background=rrb.Background(color=[30, 30, 30]),
+                    eye_controls=rrb.EyeControls3D(
+                        kind="Orbital",
+                        position=[0, 0, 80],
+                        look_target=[0, 0, 0],
+                        eye_up=[1, 0, 0],
+                        tracking_entity="world/ego",
+                    ),
                 ),
                 row_shares=[1],
             ),
@@ -198,8 +205,9 @@ def main():
                 rrb.Spatial2DView(name="Depth Rendered", contents="range_image/depth/rendered/**"),
                 rrb.Spatial2DView(name="Intensity GT", contents="range_image/intensity/gt/**"),
                 rrb.Spatial2DView(name="Intensity Rendered", contents="range_image/intensity/rendered/**"),
-                rrb.TimeSeriesView(name="Depth Error", contents="metrics/**"),
-                row_shares=[1, 1, 1, 1, 1],
+                rrb.Spatial2DView(name="Depth Error (per-point, 0-5m)", contents="range_image/depth_error/**"),
+                rrb.TimeSeriesView(name="Depth Error (m/point)", contents="metrics/**"),
+                row_shares=[1, 1, 1, 1, 1, 1],
             ),
             column_shares=[3, 1],
         ),
@@ -253,19 +261,19 @@ def main():
         rendered_intensity_np = rendered_intensity.clamp(0, 1).cpu().numpy()
         mask = rendered_rayhit_np
 
-        # 3D point clouds
-        gt_pts = lidar.inverse_projection_with_range(
-            frame_id, gt_depth_np, gt_rayhit_np
-        ).cpu().numpy().astype(np.float64)
-        rendered_pts = lidar.inverse_projection_with_range(
-            frame_id, rendered_depth_np, mask
-        ).cpu().numpy().astype(np.float64)
+        # 3D point clouds: get all (H,W,3) points, then filter by mask in numpy
+        gt_all_pts = lidar.range2point(frame_id, gt_depth_np).cpu().numpy().astype(np.float64)
+        rd_all_pts = lidar.range2point(frame_id, rendered_depth_np).cpu().numpy().astype(np.float64)
 
-        gt_colors = depth_to_colors(np.linalg.norm(gt_pts, axis=1), 0.0, args.max_depth)
-        rendered_colors = depth_to_colors(np.linalg.norm(rendered_pts, axis=1), 0.0, args.max_depth)
+        gt_mask_2d = gt_rayhit_np.squeeze(-1).astype(bool)
+        rd_mask_2d = mask.squeeze(-1).astype(bool)
 
-        gt_pts -= origin_offset
-        rendered_pts -= origin_offset
+        gt_pts = gt_all_pts[gt_mask_2d] - origin_offset
+        rendered_pts = rd_all_pts[rd_mask_2d] - origin_offset
+
+        gt_colors = np.full((len(gt_pts), 3), [255, 255, 255], dtype=np.uint8)
+        rendered_colors = np.full((len(rendered_pts), 3), [0, 255, 0], dtype=np.uint8)
+
         rr.log("world/pointcloud/gt", rr.Points3D(gt_pts, colors=gt_colors, radii=0.05))
         rr.log("world/pointcloud/rendered", rr.Points3D(rendered_pts, colors=rendered_colors, radii=0.05))
 
@@ -281,8 +289,10 @@ def main():
             if frame_id in bbox.frame:
                 pos, quat, _, _ = bbox.frame[frame_id]
                 centers.append(pos.cpu().numpy() - origin_offset)
-                sizes.append(bbox.size.cpu().numpy())
-                quats.append(quat.squeeze(0).cpu().numpy())
+                s = bbox.size.cpu().numpy()
+                sizes.append(s[[1, 0, 2]])  # T4 [width,length,height] -> [length,width,height]
+                q_wxyz = quat.squeeze(0).cpu().numpy()
+                quats.append(q_wxyz[[1, 2, 3, 0]])  # wxyz -> xyzw for Rerun
                 labels.append(str(obj_id)[:8])
         if centers:
             rr.log("world/bboxes", rr.Boxes3D(
@@ -315,12 +325,18 @@ def main():
         rr.log("range_image/depth_raw/gt", rr.DepthImage(gt_depth_np.squeeze(-1), meter=1.0))
         rr.log("range_image/depth_raw/rendered", rr.DepthImage(rd_masked.squeeze(-1), meter=1.0))
 
-        # Per-frame metrics
+        # Per-frame metrics (per-point error image + scalar stats)
         valid = (gt_rayhit_np.squeeze(-1) > 0) & (rd_masked.squeeze(-1) > 0)
         if valid.any():
-            err = np.abs(gt_depth_np.squeeze(-1)[valid] - rd_masked.squeeze(-1)[valid])
-            rr.log("metrics/depth_mae_m", rr.Scalars(float(err.mean())))
-            rr.log("metrics/depth_rmse_m", rr.Scalars(float(np.sqrt((err**2).mean()))))
+            err_map = np.zeros_like(gt_depth_np.squeeze(-1))
+            err_map[valid] = np.abs(gt_depth_np.squeeze(-1)[valid] - rd_masked.squeeze(-1)[valid])
+            # Per-point depth error as heatmap (meters)
+            err_vis = depth_to_colormap(err_map, 0.0, 5.0) * valid[..., None].astype(np.uint8)
+            rr.log("range_image/depth_error", rr.Image(err_vis))
+            # Scalar stats
+            err = err_map[valid]
+            rr.log("metrics/MAE (m/point)", rr.Scalars(float(err.mean())))
+            rr.log("metrics/RMSE (m/point)", rr.Scalars(float(np.sqrt((err**2).mean()))))
 
         frame_label = "EVAL" if frame_id in eval_frames else "TRAIN"
         rr.log("metadata/frame_type", rr.TextDocument(f"Frame {frame_id} ({frame_label})"))
