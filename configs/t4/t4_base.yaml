@@ -1,0 +1,16 @@
+data_type: "T4"
+
+# LiDAR channel to use (per-sensor, not concatenated)
+lidar_channel: "LIDAR_TOP"
+
+# Topic mapping: T4 channel name -> ROS topic in rosbag
+# Override this in scene-specific configs for your sensor setup
+topic_mapping:
+  LIDAR_TOP: "/sensing/lidar/top/pointcloud_raw"
+
+# Range image parameters
+range_image_width: 1024
+range_image_height: 64
+inc_bottom: -25.0
+inc_top: 15.0
+max_depth: 120.0

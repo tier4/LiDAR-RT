@@ -47,6 +47,9 @@ class LiDARSensor:
         elif self.data_type == "KITTI":
             self.pixel_offset = 0.0
             self.angle_offset = 0.0
+        elif self.data_type == "T4":
+            self.pixel_offset = 0.0
+            self.angle_offset = 0.0
         else:
             raise ValueError("Could not recongnize the data type")
 
