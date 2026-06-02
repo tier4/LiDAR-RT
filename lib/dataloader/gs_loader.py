@@ -31,7 +31,8 @@ class SceneLidar(Scene):
             )
         ]
 
-        lidar: Dict[int, LiDARSensor] = waymo_raw_pkg[0]
+        # Multi-sensor support: lidars_dict is dict[str, LiDARSensor]
+        lidars_dict: Dict[str, LiDARSensor] = waymo_raw_pkg[0]
         bboxes: Dict[str, BoundingBox] = waymo_raw_pkg[1]
         frame_range = args.frame_length
         eval_frames = args.eval_frames
@@ -41,10 +42,13 @@ class SceneLidar(Scene):
             if frame_id not in eval_frames
         ]
 
-        self.train_lidar = lidar
-        self.train_lidar.set_frames(train_frames, eval_frames)
+        self.train_lidars = lidars_dict
+        for sensor_name, lidar in self.train_lidars.items():
+            lidar.set_frames(train_frames, eval_frames)
 
-        print("[Loaded] background guassians")
+        # Backward compat: train_lidar returns first sensor
+        self._sensor_names = list(self.train_lidars.keys())
+        print(f"[Loaded] {len(self._sensor_names)} LiDAR sensor(s): {self._sensor_names}")
 
         # initialize objects with bounding boxes
         if args.dynamic:
@@ -79,12 +83,21 @@ class SceneLidar(Scene):
                 print("No dynamic objects in the scene")
                 args.dynamic = False
 
-        # initialize bkgd points
+        # initialize bkgd points — aggregate from ALL sensors
         all_points = []
         all_intensity = []
         all_normals = []
         for frame in range(frame_range[0], frame_range[1] + 1):
-            lidar_pts, lidar_intensity = lidar.inverse_projection(frame)
+            # Collect points from all sensors for this frame
+            frame_pts_list = []
+            frame_int_list = []
+            for sensor_name, lidar in self.train_lidars.items():
+                pts, intensity = lidar.inverse_projection(frame)
+                frame_pts_list.append(pts)
+                frame_int_list.append(intensity)
+
+            lidar_pts = torch.cat(frame_pts_list, dim=0)
+            lidar_intensity = torch.cat(frame_int_list, dim=0)
 
             points_lidar = o3d.geometry.PointCloud()
             points_lidar.points = o3d.utility.Vector3dVector(
@@ -217,6 +230,11 @@ class SceneLidar(Scene):
 
         print("[Loaded] object guassians")
 
+    @property
+    def train_lidar(self):
+        """Backward compat: return first sensor."""
+        return self.train_lidars[self._sensor_names[0]]
+
     def training_setup(self, args):
         for gs in self.gaussians_assets:
             gs.training_setup(args)
@@ -263,8 +281,6 @@ class SceneLidar(Scene):
 
             # Densification
             if iteration < args.opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                # gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(
                     instance_mean_grads, instance_accum_weights
                 )

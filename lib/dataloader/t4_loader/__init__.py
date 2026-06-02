@@ -66,40 +66,30 @@ def _pointcloud_to_range_image(xyzs, intensities, H, W, inc_bottom, inc_top, max
 
 
 def _get_sensor2ego(t4, channel):
-    """Get sensor-to-ego transform for a given channel.
-
-    Args:
-        t4: T4Devkit instance.
-        channel: Sensor channel name.
-
-    Returns:
-        sensor2ego: (4, 4) numpy array.
-    """
-    # Find the calibrated sensor for this channel
+    """Get sensor-to-ego transform for a given channel from T4 DB."""
     for cs in t4.calibrated_sensor:
         sensor = t4.get("sensor", cs.sensor_token)
         if sensor.channel == channel:
-            # Build 4x4 transform from translation + rotation
             q = Quaternion(cs.rotation)
             rotation_matrix = q.rotation_matrix
             sensor2ego = np.eye(4, dtype=np.float64)
             sensor2ego[:3, :3] = rotation_matrix
             sensor2ego[:3, 3] = np.array(cs.translation)
             return sensor2ego
-
     raise ValueError(f"Could not find calibrated sensor for channel: {channel}")
 
 
+def _build_sensor2ego(translation, rotation_wxyz):
+    """Build sensor2ego 4x4 matrix from translation and quaternion (wxyz)."""
+    q = Quaternion(rotation_wxyz)
+    sensor2ego = np.eye(4, dtype=np.float64)
+    sensor2ego[:3, :3] = q.rotation_matrix
+    sensor2ego[:3, 3] = np.array(translation)
+    return sensor2ego
+
+
 def _get_ego2world(t4, ego_pose_token):
-    """Get ego-to-world transform from an ego pose token.
-
-    Args:
-        t4: T4Devkit instance.
-        ego_pose_token: Token string for the ego pose.
-
-    Returns:
-        ego2world: (4, 4) numpy array.
-    """
+    """Get ego-to-world transform from an ego pose token."""
     ego_pose = t4.get("ego_pose", ego_pose_token)
     q = Quaternion(ego_pose.rotation)
     rotation_matrix = q.rotation_matrix
@@ -110,26 +100,138 @@ def _get_ego2world(t4, ego_pose_token):
 
 
 def load_t4_raw(base_dir, args):
-    """Load T4 dataset and convert to LiDAR-RT format.
+    """Load T4 dataset with multi-LiDAR support.
 
-    Args:
-        base_dir: Path to the T4 dataset root directory.
-        args: Configuration arguments. Expected fields:
-            - frame_length: [start_frame, end_frame]
-            - data_type: "T4"
-            - lidar_channel: LiDAR channel name (e.g. "LIDAR_TOP")
-            - topic_mapping: dict mapping channel -> ROS topic (for rosbag)
-            - range_image_width: Width of generated range image (default: 1024)
-            - range_image_height: Height of generated range image (default: 64)
-            - inc_bottom: Bottom inclination in degrees (default: -25.0)
-            - inc_top: Top inclination in degrees (default: 15.0)
-            - max_depth: Maximum depth in meters (default: 120.0)
+    If args.lidar_sensors is defined, loads each sensor individually from
+    rosbag via t4-devkit. Otherwise falls back to single-channel loading.
 
     Returns:
-        lidar: LiDARSensor instance.
-        bboxes: Dict[str, BoundingBox] mapping object IDs to bounding boxes.
+        lidars: dict[str, LiDARSensor] — one sensor per channel.
+        bboxes: dict[str, BoundingBox] — shared across all sensors.
     """
-    # Configuration
+    lidar_sensors_cfg = getattr(args, "lidar_sensors", None)
+
+    if lidar_sensors_cfg:
+        return _load_t4_multi_lidar(base_dir, args, lidar_sensors_cfg)
+    else:
+        # Fallback: single-channel mode (backward compat)
+        lidar, bboxes = _load_t4_single_lidar(base_dir, args)
+        sensor_name = getattr(args, "lidar_channel", "LIDAR_CONCAT")
+        return {sensor_name: lidar}, bboxes
+
+
+def _load_t4_multi_lidar(base_dir, args, lidar_sensors_cfg):
+    """Load multiple LiDAR sensors from rosbag.
+
+    Uses LIDAR_CONCAT sample_data for timestamps and ego poses,
+    then reads each sensor's pandar_packets from rosbag at matching timestamps.
+    """
+    from t4_devkit.rosbag import Rosbag2Reader, TopicMapping
+
+    # Load T4 DB for timestamps, ego poses, and bounding boxes
+    t4 = T4Devkit(base_dir, use_rosbag=False)
+
+    # Get LIDAR_CONCAT sample_data for timestamps and ego poses
+    lidar_sample_datas = []
+    for sd in t4.sample_data:
+        if sd.channel == "LIDAR_CONCAT" and sd.is_key_frame:
+            lidar_sample_datas.append(sd)
+    lidar_sample_datas.sort(key=lambda sd: sd.timestamp)
+
+    frames = list(args.frame_length)
+    if frames[1] >= len(lidar_sample_datas):
+        frames = [frames[0], len(lidar_sample_datas) - 1]
+        print(yellow(f"Warning: Clamped frame range to [0, {frames[1]}]"))
+
+    # Collect timestamps and ego poses from LIDAR_CONCAT sample_data
+    frame_timestamps = {}  # frame_id -> timestamp_us
+    frame_ego2world = {}   # frame_id -> (4, 4) numpy array
+    for frame in range(frames[0], frames[1] + 1):
+        sd = lidar_sample_datas[frame]
+        frame_timestamps[frame] = sd.timestamp
+        frame_ego2world[frame] = _get_ego2world(t4, sd.ego_pose_token)
+
+    # Open rosbag reader with all sensor topics
+    bag_dir = os.path.join(base_dir, "input_bag")
+    topic_mappings = [
+        TopicMapping(channel=s["name"], topic=s["topic"])
+        for s in lidar_sensors_cfg
+    ]
+    reader = Rosbag2Reader(bag_dir, topic_mapping=topic_mappings)
+
+    # Load each sensor
+    lidars = {}
+    for sensor_cfg in lidar_sensors_cfg:
+        sensor_name = sensor_cfg["name"]
+        topic = sensor_cfg["topic"]
+        H = sensor_cfg.get("range_image_height", 64)
+        W = sensor_cfg.get("range_image_width", 1800)
+        inc_bottom = math.radians(sensor_cfg.get("inc_bottom", -25.0))
+        inc_top = math.radians(sensor_cfg.get("inc_top", 15.0))
+        max_depth = sensor_cfg.get("max_depth", 200.0)
+
+        # Build sensor2ego transform
+        s2e_trans = sensor_cfg.get("sensor2ego_translation", [0, 0, 0])
+        s2e_rot = sensor_cfg.get("sensor2ego_rotation", [1, 0, 0, 0])
+        sensor2ego = _build_sensor2ego(s2e_trans, s2e_rot)
+
+        lidar = LiDARSensor(
+            sensor2ego=sensor2ego,
+            name=sensor_name,
+            inclination_bounds=(inc_bottom, inc_top),
+            data_type="T4",
+        )
+
+        # Cache directory
+        cache_dir = os.path.join(base_dir, "cache", sensor_name)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        print(f"  Loading sensor: {sensor_name} ({topic})")
+        for frame in tqdm(range(frames[0], frames[1] + 1), desc=f"  {sensor_name}"):
+            ego2world = frame_ego2world[frame]
+            timestamp_us = frame_timestamps[frame]
+
+            cache_path = os.path.join(cache_dir, f"range_image_frame_{frame}.pt")
+            if os.path.exists(cache_path):
+                cached = torch.load(cache_path, weights_only=True)
+                range_image_r1 = cached["r1"]
+                range_image_r2 = cached["r2"]
+            else:
+                # Read point cloud from rosbag via pandar decoder
+                try:
+                    pc = reader.get_pointcloud(sensor_name, timestamp_us)
+                    points = pc.points.T  # (N, 4)
+                    xyzs = points[:, :3]
+                    intensities = points[:, 3]
+                except (KeyError, ValueError) as e:
+                    print(yellow(f"    Warning: frame {frame} skipped for {sensor_name}: {e}"))
+                    xyzs = np.zeros((0, 3))
+                    intensities = np.zeros(0)
+
+                range_image_r1 = _pointcloud_to_range_image(
+                    xyzs, intensities, H, W, inc_bottom, inc_top, max_depth
+                )
+                range_image_r1[range_image_r1 == -1] = 0
+                range_image_r2 = np.zeros_like(range_image_r1)
+
+                range_image_r1 = torch.from_numpy(range_image_r1).float()
+                range_image_r2 = torch.from_numpy(range_image_r2).float()
+                torch.save({"r1": range_image_r1, "r2": range_image_r2}, cache_path)
+
+            lidar.add_frame(frame, ego2world, range_image_r1, range_image_r2)
+
+        lidars[sensor_name] = lidar
+
+    reader.close()
+
+    # Load bounding boxes (shared across all sensors)
+    bboxes = _load_t4_bboxes(t4, lidar_sample_datas, frames, args)
+
+    return lidars, bboxes
+
+
+def _load_t4_single_lidar(base_dir, args):
+    """Load T4 dataset with single LiDAR channel (backward compat)."""
     lidar_channel = getattr(args, "lidar_channel", "LIDAR_TOP")
     topic_mapping = getattr(args, "topic_mapping", None)
     use_rosbag = getattr(args, "use_rosbag", False)
@@ -139,25 +241,21 @@ def load_t4_raw(base_dir, args):
     inc_top = math.radians(getattr(args, "inc_top", 15.0))
     max_depth = getattr(args, "max_depth", 120.0)
 
-    # Initialize T4Devkit
     t4 = T4Devkit(base_dir, use_rosbag=use_rosbag, topic_mapping=topic_mapping)
 
-    # Get sensor calibration (sensor2ego)
     sensor2ego = _get_sensor2ego(t4, lidar_channel)
 
-    # Find all sample_data entries for the target LiDAR channel, sorted by timestamp
     lidar_sample_datas = []
     for sd in t4.sample_data:
         if sd.channel == lidar_channel and sd.is_key_frame:
             lidar_sample_datas.append(sd)
     lidar_sample_datas.sort(key=lambda sd: sd.timestamp)
 
-    frames = args.frame_length
+    frames = list(args.frame_length)
     if frames[1] >= len(lidar_sample_datas):
         frames = [frames[0], len(lidar_sample_datas) - 1]
         print(yellow(f"Warning: Clamped frame range to [0, {frames[1]}]"))
 
-    # Initialize LiDARSensor
     lidar = LiDARSensor(
         sensor2ego=sensor2ego,
         name=lidar_channel,
@@ -165,74 +263,50 @@ def load_t4_raw(base_dir, args):
         data_type=args.data_type,
     )
 
-    # Cache directory for range images
     cache_dir = os.path.join(base_dir, "cache", lidar_channel)
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Process each frame
     for frame in tqdm(range(frames[0], frames[1] + 1)):
         sd = lidar_sample_datas[frame]
-
-        # Get ego pose
         ego2world = _get_ego2world(t4, sd.ego_pose_token)
 
-        # Check cache
         cache_path = os.path.join(cache_dir, f"range_image_frame_{frame}.pt")
         if os.path.exists(cache_path):
             cached = torch.load(cache_path, weights_only=True)
             range_image_r1 = cached["r1"]
             range_image_r2 = cached["r2"]
         else:
-            # Get point cloud from rosbag (per-sensor, not concatenated)
             pc = t4.get_lidar_pointcloud(sd.token)
-            # pc.points is (4, N) array: [x, y, z, intensity]
             points = pc.points.T  # (N, 4)
-            xyzs = points[:, :3]  # sensor frame coordinates
+            xyzs = points[:, :3]
             intensities = points[:, 3]
 
-            # Convert point cloud to range image
             range_image_r1 = _pointcloud_to_range_image(
                 xyzs, intensities, H, W, inc_bottom, inc_top, max_depth
             )
             range_image_r1[range_image_r1 == -1] = 0
             range_image_r2 = np.zeros_like(range_image_r1)
 
-            # Convert to tensors and cache
             range_image_r1 = torch.from_numpy(range_image_r1).float()
             range_image_r2 = torch.from_numpy(range_image_r2).float()
             torch.save({"r1": range_image_r1, "r2": range_image_r2}, cache_path)
 
         lidar.add_frame(frame, ego2world, range_image_r1, range_image_r2)
 
-    # Load bounding boxes from T4 annotations
     bboxes = _load_t4_bboxes(t4, lidar_sample_datas, frames, args)
-
     return lidar, bboxes
 
 
 def _load_t4_bboxes(t4, lidar_sample_datas, frames, args):
-    """Load 3D bounding boxes from T4 annotations.
-
-    Args:
-        t4: T4Devkit instance.
-        lidar_sample_datas: List of sample_data sorted by timestamp.
-        frames: [start_frame, end_frame].
-        args: Configuration arguments.
-
-    Returns:
-        bboxes: Dict[str, BoundingBox].
-    """
+    """Load 3D bounding boxes from T4 annotations."""
     bboxes = {}
     vehicle_categories = {"car", "truck", "bus", "bicycle", "motorcycle", "trailer"}
 
     for frame in range(frames[0], frames[1] + 1):
         sd = lidar_sample_datas[frame]
-
-        # Use get_box3ds API to get annotations for this sample_data
         boxes = t4.get_box3ds(sd.token)
 
         for box in boxes:
-            # Filter by vehicle categories
             label_name = box.semantic_label.name
             category_name = label_name.split(".")[-1] if "." in label_name else label_name
             if category_name not in vehicle_categories:
@@ -244,7 +318,6 @@ def _load_t4_bboxes(t4, lidar_sample_datas, frames, args):
             if object_id not in bboxes:
                 bboxes[object_id] = BoundingBox(1, object_id, torch.tensor(size).float())
 
-            # Box3D position and rotation are in world frame
             position = np.array(box.position)
             rotation_matrix = box.rotation.rotation_matrix
 

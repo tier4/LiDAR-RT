@@ -43,12 +43,35 @@ class LiDARRTMeter:
         print("Loading model with iteration: ", first_iter)
         scene.restore(model_params, self.args.opt)
 
-        self.unet = None
+        # Load per-sensor UNets
+        self.unets = {}
         if args.unet:
             in_channels = 9 if args.refine.use_spatial else 3
-            self.unet = UNet(in_channels=in_channels, out_channels=1).cuda()
-            unet_params = torch.load(args.unet)
-            self.unet.load_state_dict(unet_params)
+            if os.path.isfile(args.unet):
+                # Single unet file: apply to first sensor (backward compat)
+                unet = UNet(in_channels=in_channels, out_channels=1).cuda()
+                unet_params = torch.load(args.unet)
+                unet.load_state_dict(unet_params)
+                first_sensor = list(scene.train_lidars.keys())[0]
+                self.unets[first_sensor] = unet
+            elif os.path.isdir(args.unet):
+                # Directory: look for unet_{sensor_name}.pth
+                for sname in scene.train_lidars:
+                    unet_path = os.path.join(args.unet, f"unet_{sname}.pth")
+                    if os.path.exists(unet_path):
+                        unet = UNet(in_channels=in_channels, out_channels=1).cuda()
+                        unet.load_state_dict(torch.load(unet_path))
+                        self.unets[sname] = unet
+                        print(f"  Loaded UNet for {sname}")
+            else:
+                # Try model directory for per-sensor unets
+                model_dir = os.path.dirname(args.model_path) if args.model_path else scene.model_save_dir
+                for sname in scene.train_lidars:
+                    unet_path = os.path.join(model_dir, f"unet_{sname}.pth")
+                    if os.path.exists(unet_path):
+                        unet = UNet(in_channels=in_channels, out_channels=1).cuda()
+                        unet.load_state_dict(torch.load(unet_path))
+                        self.unets[sname] = unet
         self.gaussians = gaussians
         self.scene = scene
         self.sensor = "lidar"
@@ -97,13 +120,15 @@ class LiDARRTMeter:
         os.makedirs(self.pcd_dir, exist_ok=True)
         os.makedirs(self.eval_dir, exist_ok=True)
 
-    def record_render(self, gaussians, background, scene, frame_id, args):
+    def record_render(self, gaussians, background, scene, frame_id, args, lidar=None, sensor_name=None):
         render_dict = dict()
 
-        points, _ = scene.train_lidar.inverse_projection(frame_id)
+        if lidar is None:
+            lidar = scene.train_lidar
+        points, _ = lidar.inverse_projection(frame_id)
         points = torch.cat([points, torch.ones((points.shape[0], 1))], dim=1).cuda()
         if self.sensor == "camera":
-            sensor = scene.train_lidar.gen_norot_cam(frame_id).cuda()
+            sensor = lidar.gen_norot_cam(frame_id).cuda()
             points_camera = points.float().cuda() @ sensor.world_view_transform
             points_proj = points_camera @ sensor.projection_matrix
             points_proj = points_proj[:, :3] / points_proj[:, 3, None]
@@ -120,13 +145,14 @@ class LiDARRTMeter:
             )
             uvz = uvz[mask]
         else:
-            sensor = scene.train_lidar
+            sensor = lidar
         rendered_pkg = raytracing(frame_id, gaussians, sensor, background, args)
         rendered_depth = rendered_pkg["depth"].detach()
         rendered_intensity = rendered_pkg["intensity"].detach()
         rendered_raydrop = rendered_pkg["raydrop"].detach()
 
-        if self.unet:
+        unet = self.unets.get(sensor_name) if sensor_name else None
+        if unet:
             H, W = rendered_depth.shape[0], rendered_depth.shape[1]
             input_depth = rendered_depth.reshape(1, H, W)
             input_intensity = rendered_intensity.reshape(1, H, W)
@@ -135,22 +161,22 @@ class LiDARRTMeter:
                 [input_raydrop, input_intensity, input_depth], dim=0
             )
             if args.refine.use_spatial:
-                ray_o, ray_d = scene.train_lidar.get_range_rays(frame_id)
+                ray_o, ray_d = lidar.get_range_rays(frame_id)
                 raydrop_prob = torch.cat(
                     [raydrop_prob, ray_o.permute(2, 0, 1), ray_d.permute(2, 0, 1)],
                     dim=0,
                 )
             raydrop_prob = raydrop_prob.unsqueeze(0)
-            rendered_raydrop = self.unet(raydrop_prob).detach().reshape(H, W, 1)
+            rendered_raydrop = unet(raydrop_prob).detach().reshape(H, W, 1)
 
-        gt_rayhit = scene.train_lidar.get_mask(frame_id).unsqueeze(-1)
+        gt_rayhit = lidar.get_mask(frame_id).unsqueeze(-1)
         if self.save_image:
             gt_rayhit_vis = gt_rayhit.repeat(1, 1, 3)
             gt_mask_vis = gt_rayhit_vis.cpu().numpy()
             gt_rayhit_vis = np.uint8(gt_mask_vis * 255)
         gt_rayhit = gt_rayhit.cpu().numpy()
 
-        gt_depth = scene.train_lidar.get_depth(frame_id)
+        gt_depth = lidar.get_depth(frame_id)
         if self.save_image:
             gt_depth_vis = (gt_depth - gt_depth.min()) / (
                 gt_depth.max() - gt_depth.min()
@@ -162,7 +188,7 @@ class LiDARRTMeter:
             gt_depth_vis = gt_depth_vis * gt_mask_vis
         gt_depth = gt_depth.unsqueeze(-1).cpu().numpy()
 
-        gt_intensity = scene.train_lidar.get_intensity(frame_id)
+        gt_intensity = lidar.get_intensity(frame_id)
         gt_intensity = gt_intensity.clamp(0, 1)
         if self.save_image:
             gt_intensity_vis = (gt_intensity - gt_intensity.min()) / (
@@ -183,11 +209,11 @@ class LiDARRTMeter:
         rendered_rayhit = rendered_rayhit.cpu().numpy()
         mask = gt_rayhit if self.use_gt_mask else rendered_rayhit
 
-        gt_pts = scene.train_lidar.inverse_projection_with_range(
+        gt_pts = lidar.inverse_projection_with_range(
             frame_id, gt_depth, gt_rayhit
         )
         gt_pts = gt_pts.cpu().numpy().astype(np.float64)
-        rendered_pts = scene.train_lidar.inverse_projection_with_range(
+        rendered_pts = lidar.inverse_projection_with_range(
             frame_id, rendered_depth, mask
         )
         rendered_pts = rendered_pts.cpu().numpy().astype(np.float64)
@@ -364,9 +390,9 @@ class LiDARRTMeter:
 
         return [chamfer_dis, f_score]
 
-    def run(self):
+    def _eval_sensor(self, sensor_name, lidar, all_frames, sensor_suffix=""):
+        """Evaluate a single sensor. Returns per-frame and aggregate metrics."""
         frames = []
-        eval_dict_all = dict()
         eval_depth = []
         eval_intensity = []
         eval_raydrop = []
@@ -375,39 +401,30 @@ class LiDARRTMeter:
         intensity_metrics = ["rmse", "mae", "medae", "lpips_loss", "ssim", "psnr"]
         raydrop_metrics = ["rmse", "acc", "f1"]
         points_metrics = ["chamfer_dist", "fscore"]
-        depth_dict = dict()
-        intensity_dict = dict()
-        raydrop_dict = dict()
-        points_dict = dict()
 
         eval_all_frame_dict = dict()
 
-        if self.eval_type == "train":
-            all_frames = self.train_frames
-        elif self.eval_type == "test":
-            all_frames = self.eval_frames
-        elif self.eval_type == "all":
-            all_frames = list(
-                range(self.args.frame_length[0], self.args.frame_length[1] + 1)
-            )
-        else:
-            raise ValueError("Invalid evaluation type.")
+        # Per-sensor output dirs
+        img_dir = os.path.join(self.image_dir, sensor_name) if sensor_suffix else self.image_dir
+        pcd_dir = os.path.join(self.pcd_dir, sensor_name) if sensor_suffix else self.pcd_dir
+        if self.save_image:
+            os.makedirs(img_dir, exist_ok=True)
+        if self.save_pcd:
+            os.makedirs(pcd_dir, exist_ok=True)
 
         for frame_id in tqdm(
-            all_frames, total=len(all_frames), desc="Metric evaluation progress"
+            all_frames, total=len(all_frames),
+            desc=f"Eval {sensor_name}"
         ):
-            eval_per_frame_dict = dict()
-            depth_per_frame_dict = dict()
-            intensity_per_frame_dict = dict()
-            raydrop_per_frame_dict = dict()
-            points_per_frame_dict = dict()
-
             render_dict = self.record_render(
-                self.gaussians, self.background, self.scene, frame_id, self.args
+                self.gaussians, self.background, self.scene, frame_id, self.args,
+                lidar=lidar, sensor_name=sensor_name,
             )
 
+            max_depth = getattr(self.args, "max_depth", 80)
             depth_per_frame = self.compute_depth_metrics(
-                render_dict["gt_depth"], render_dict["rendered_depth"]
+                render_dict["gt_depth"], render_dict["rendered_depth"],
+                max_depth=max_depth,
             )
             intensity_per_frame = self.compute_intensity_metrics(
                 render_dict["gt_intensity"], render_dict["rendered_intensity"]
@@ -424,104 +441,119 @@ class LiDARRTMeter:
             eval_raydrop.append(raydrop_per_frame)
             eval_points.append(points_per_frame)
 
-            for metric, result in zip(depth_metrics, depth_per_frame):
-                depth_per_frame_dict.update({metric: torch.tensor(result).cpu().item()})
+            depth_per_frame_dict = {m: torch.tensor(r).cpu().item() for m, r in zip(depth_metrics, depth_per_frame)}
+            intensity_per_frame_dict = {m: torch.tensor(r).cpu().item() for m, r in zip(intensity_metrics, intensity_per_frame)}
+            raydrop_per_frame_dict = {m: torch.tensor(r).cpu().item() for m, r in zip(raydrop_metrics, raydrop_per_frame)}
+            points_per_frame_dict = {m: torch.tensor(r).cpu().item() for m, r in zip(points_metrics, points_per_frame)}
 
-            for metric, result in zip(intensity_metrics, intensity_per_frame):
-                intensity_per_frame_dict.update(
-                    {metric: torch.tensor(result).cpu().item()}
-                )
-
-            for metric, result in zip(raydrop_metrics, raydrop_per_frame):
-                raydrop_per_frame_dict.update(
-                    {metric: torch.tensor(result).cpu().item()}
-                )
-
-            for metric, result in zip(points_metrics, points_per_frame):
-                points_per_frame_dict.update(
-                    {metric: torch.tensor(result).cpu().item()}
-                )
-
-            eval_per_frame_dict.update(
-                {
-                    "depth": depth_per_frame_dict,
-                    "intensity": intensity_per_frame_dict,
-                    "raydrop": raydrop_per_frame_dict,
-                    "points": points_per_frame_dict,
-                }
-            )
-
-            eval_all_frame_dict.update({frame_id: eval_per_frame_dict})
+            eval_all_frame_dict[frame_id] = {
+                "depth": depth_per_frame_dict,
+                "intensity": intensity_per_frame_dict,
+                "raydrop": raydrop_per_frame_dict,
+                "points": points_per_frame_dict,
+            }
 
             if self.save_image:
                 concat_image = np.concatenate(
                     (
                         render_dict["rendered_depth_vis"],
                         render_dict["gt_depth_vis"],
-                        # render_dict['rendered_depth_vis']-render_dict['gt_depth_vis'],
                         render_dict["rendered_intensity_vis"],
                         render_dict["gt_intensity_vis"],
-                        # render_dict['rendered_intensity_vis']-render_dict['gt_intensity_vis'],
                         render_dict["rendered_rayhit_vis"],
                         render_dict["gt_rayhit_vis"],
-                        # render_dict['rendered_rayhit_vis']-render_dict['gt_rayhit_vis'],
                     ),
                     axis=0,
                 )
                 rgb_image = cv2.cvtColor(concat_image, cv2.COLOR_BGR2RGB)
                 image_path = os.path.join(
-                    self.image_dir, f"{frame_id:4d}_concat_image.jpg"
+                    img_dir, f"{frame_id:4d}_concat_image.jpg"
                 )
                 imageio.imwrite(image_path, concat_image)
                 frames.append(rgb_image)
 
             if self.save_pcd:
                 o3d.io.write_point_cloud(
-                    os.path.join(self.pcd_dir, f"{frame_id:04d}_gt_pcd.ply"),
+                    os.path.join(pcd_dir, f"{frame_id:04d}_gt_pcd.ply"),
                     render_dict["gt_pcd"],
                 )
                 o3d.io.write_point_cloud(
-                    os.path.join(self.pcd_dir, f"{frame_id:04d}_rendered_pcd.ply"),
+                    os.path.join(pcd_dir, f"{frame_id:04d}_rendered_pcd.ply"),
                     render_dict["rendered_pcd"],
                 )
 
+        # Aggregate metrics
         eval_depth = np.mean(np.array(eval_depth), axis=0)
         eval_intensity = np.mean(np.array(eval_intensity), axis=0)
         eval_raydrop = np.mean(np.array(eval_raydrop), axis=0)
         eval_points = np.mean(np.array(eval_points), axis=0)
 
-        for metric, result in zip(depth_metrics, eval_depth):
-            depth_dict.update({metric: torch.tensor(result).mean().cpu().item()})
+        eval_dict = {
+            "depth": {m: torch.tensor(r).mean().cpu().item() for m, r in zip(depth_metrics, eval_depth)},
+            "intensity": {m: torch.tensor(r).mean().cpu().item() for m, r in zip(intensity_metrics, eval_intensity)},
+            "raydrop": {m: torch.tensor(r).mean().cpu().item() for m, r in zip(raydrop_metrics, eval_raydrop)},
+            "points": {m: torch.tensor(r).mean().cpu().item() for m, r in zip(points_metrics, eval_points)},
+        }
 
-        for metric, result in zip(intensity_metrics, eval_intensity):
-            intensity_dict.update({metric: torch.tensor(result).mean().cpu().item()})
+        if self.save_image and frames:
+            vid_dir = os.path.join(self.video_dir, sensor_name) if sensor_suffix else self.video_dir
+            os.makedirs(vid_dir, exist_ok=True)
+            video_path = os.path.join(vid_dir, "render_video.mp4")
+            imageio.mimsave(video_path, np.array(frames), fps=5)
 
-        for metric, result in zip(raydrop_metrics, eval_raydrop):
-            raydrop_dict.update({metric: torch.tensor(result).mean().cpu().item()})
+        return eval_dict, eval_all_frame_dict
 
-        for metric, result in zip(points_metrics, eval_points):
-            points_dict.update({metric: torch.tensor(result).mean().cpu().item()})
+    def run(self):
+        if self.eval_type == "train":
+            all_frames = self.train_frames
+        elif self.eval_type == "test":
+            all_frames = self.eval_frames
+        elif self.eval_type == "all":
+            all_frames = list(
+                range(self.args.frame_length[0], self.args.frame_length[1] + 1)
+            )
+        else:
+            raise ValueError("Invalid evaluation type.")
 
-        eval_dict_all.update(
-            {
-                "depth": depth_dict,
-                "intensity": intensity_dict,
-                "raydrop": raydrop_dict,
-                "points": points_dict,
-            }
-        )
+        sensor_names = list(self.scene.train_lidars.keys())
+        multi_sensor = len(sensor_names) > 1
+
+        all_sensor_results = {}
+        all_sensor_per_frame = {}
+
+        for sensor_name in sensor_names:
+            lidar = self.scene.train_lidars[sensor_name]
+            suffix = sensor_name if multi_sensor else ""
+            eval_dict, eval_per_frame = self._eval_sensor(
+                sensor_name, lidar, all_frames, sensor_suffix=suffix,
+            )
+            all_sensor_results[sensor_name] = eval_dict
+            all_sensor_per_frame[sensor_name] = eval_per_frame
+            print(f"\n[{sensor_name}] Results:")
+            for category, metrics in eval_dict.items():
+                print(f"  {category}: {metrics}")
+
+        # Compute aggregate across all sensors
+        if multi_sensor:
+            agg_dict = {}
+            for category in ["depth", "intensity", "raydrop", "points"]:
+                agg_cat = {}
+                for metric in all_sensor_results[sensor_names[0]][category]:
+                    values = [all_sensor_results[s][category][metric] for s in sensor_names]
+                    agg_cat[metric] = float(np.mean(values))
+                agg_dict[category] = agg_cat
+            all_sensor_results["aggregate"] = agg_dict
+            print(f"\n[Aggregate] Results:")
+            for category, metrics in agg_dict.items():
+                print(f"  {category}: {metrics}")
 
         if self.save_eval:
             eval_path = os.path.join(self.eval_dir, "results_all.json")
             eval_per_frame_path = os.path.join(self.eval_dir, "results_per_frame.json")
             with open(eval_path, "w") as fp:
-                json.dump(eval_dict_all, fp, indent=4)
+                json.dump(all_sensor_results, fp, indent=4)
             with open(eval_per_frame_path, "w") as fp:
-                json.dump(eval_all_frame_dict, fp, indent=4)
-
-        if self.save_image:
-            video_path = os.path.join(self.video_dir, "render_video.mp4")
-            imageio.mimsave(video_path, np.array(frames), fps=5)
+                json.dump(all_sensor_per_frame, fp, indent=4)
 
 
 def parse_args():

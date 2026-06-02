@@ -107,7 +107,7 @@ def training(args):
 
     BFLoss = BinaryFocalLoss()
     BCELoss = BinaryCrossEntropyLoss()
-    frame_stack = []
+    frame_stack = []  # list of (sensor_name, frame_id) tuples
 
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
@@ -134,11 +134,16 @@ def training(args):
         if iteration % 1000 == 0:
             scene.oneupSHdegree()
 
-        # Pick a random frame
+        # Pick a random (sensor, frame) pair
         if not frame_stack:
-            frame_stack = list(scene.train_lidar.train_frames)
+            frame_stack = [
+                (sensor_name, fid)
+                for sensor_name, lidar in scene.train_lidars.items()
+                for fid in lidar.train_frames
+            ]
             random.shuffle(frame_stack)
-        frame = frame_stack.pop()
+        sensor_name, frame = frame_stack.pop()
+        cur_lidar = scene.train_lidars[sensor_name]
         data_time = time.time() - end
 
         # Render
@@ -146,7 +151,7 @@ def training(args):
             args.pipe.debug = True
 
         render_pkg = raytracing(
-            frame, gaussians_assets, scene.train_lidar, background, args
+            frame, gaussians_assets, cur_lidar, background, args
         )
         batch_time = time.time() - end
         depth = render_pkg["depth"]
@@ -157,18 +162,18 @@ def training(args):
 
         H, W = depth.shape[0], depth.shape[1]
 
-        gt_mask = scene.train_lidar.get_mask(frame).cuda()
+        gt_mask = cur_lidar.get_mask(frame).cuda()
 
         # === Depth loss ===
         depth = depth.squeeze(-1)
-        gt_depth = scene.train_lidar.get_depth(frame).cuda()
+        gt_depth = cur_lidar.get_depth(frame).cuda()
         loss_depth = args.opt.lambda_depth_l1 * l1_loss(
             depth[gt_mask], gt_depth[gt_mask]
         )
 
         # === Intensity loss ===
         intensity = intensity.squeeze(-1)
-        gt_intensity = scene.train_lidar.get_intensity(frame).cuda()
+        gt_intensity = cur_lidar.get_intensity(frame).cuda()
         loss_intensity = (
             args.opt.lambda_intensity_l1
             * l1_loss(intensity[gt_mask], gt_intensity[gt_mask])
@@ -195,10 +200,10 @@ def training(args):
 
         # === CD loss ===
         chamLoss = chamfer_3DDist()
-        gt_pts = scene.train_lidar.inverse_projection_with_range(
+        gt_pts = cur_lidar.inverse_projection_with_range(
             frame, gt_depth, gt_mask
         )
-        pred_pts = scene.train_lidar.inverse_projection_with_range(
+        pred_pts = cur_lidar.inverse_projection_with_range(
             frame, depth, gt_mask
         )
 
@@ -270,7 +275,7 @@ def training(args):
 
             if iteration % args.visual_interval == 0:
                 render_pkg = raytracing(
-                    frame_s, gaussians_assets, scene.train_lidar, background, args
+                    frame_s, gaussians_assets, scene.train_lidar, background, args  # first sensor for viz
                 )
                 rendered_depth = render_pkg["depth"]
                 rendered_intensity = render_pkg["intensity"]
@@ -328,37 +333,41 @@ def training(args):
             if iteration % args.testing_iterations == 0:
                 if iteration >= args.saving_iterations[0] - 3000:
                     mix_metric = 0
-                    for frame in scene.train_lidar.eval_frames:
-                        render_pkg = raytracing(
-                            frame, gaussians_assets, scene.train_lidar, background, args
-                        )
-                        depth = render_pkg["depth"].detach()
-                        intensity = render_pkg["intensity"].detach()
-                        raydrop_prob = render_pkg["raydrop"].detach()
-                        mask = raydrop_prob < 0.5
+                    eval_count = 0
+                    for eval_sensor_name, eval_lidar in scene.train_lidars.items():
+                        for frame in eval_lidar.eval_frames:
+                            render_pkg = raytracing(
+                                frame, gaussians_assets, eval_lidar, background, args
+                            )
+                            depth = render_pkg["depth"].detach()
+                            intensity = render_pkg["intensity"].detach()
+                            raydrop_prob = render_pkg["raydrop"].detach()
+                            mask = raydrop_prob < 0.5
 
-                        gt_depth = scene.train_lidar.get_depth(frame).cuda()
-                        gt_intensity = scene.train_lidar.get_intensity(frame).cuda()
-                        gt_mask = scene.train_lidar.get_mask(frame).cuda()
-                        psnr_depth = (
-                            psnr(
-                                depth[..., 0] * mask[..., 0] / 80,
-                                gt_depth * gt_mask / 80,
+                            gt_depth = eval_lidar.get_depth(frame).cuda()
+                            gt_intensity = eval_lidar.get_intensity(frame).cuda()
+                            gt_mask = eval_lidar.get_mask(frame).cuda()
+                            depth_norm = getattr(args, "max_depth", 80)
+                            psnr_depth = (
+                                psnr(
+                                    depth[..., 0] * mask[..., 0] / depth_norm,
+                                    gt_depth * gt_mask / depth_norm,
+                                )
+                                .mean()
+                                .item()
                             )
-                            .mean()
-                            .item()
-                        )
-                        intensity = intensity.clamp(0, 1)
-                        gt_intensity = gt_intensity.clamp(0, 1)
-                        psnr_intensity = (
-                            psnr(
-                                intensity[..., 0] * mask[..., 0], gt_intensity * gt_mask
+                            intensity = intensity.clamp(0, 1)
+                            gt_intensity = gt_intensity.clamp(0, 1)
+                            psnr_intensity = (
+                                psnr(
+                                    intensity[..., 0] * mask[..., 0], gt_intensity * gt_mask
+                                )
+                                .mean()
+                                .item()
                             )
-                            .mean()
-                            .item()
-                        )
-                        mix_metric += psnr_depth + psnr_intensity
-                    mix_metric /= len(scene.train_lidar.eval_frames)
+                            mix_metric += psnr_depth + psnr_intensity
+                            eval_count += 1
+                    mix_metric /= max(eval_count, 1)
                     print(mix_metric, best_mix_metric)
                     if mix_metric > best_mix_metric:
                         for file in os.listdir(scene.model_save_dir):
@@ -386,17 +395,30 @@ def training(args):
     if args.refine.use_refine:
         print(output_dir)
         in_channels = 9 if args.refine.use_spatial else 3
-        unet = UNet(in_channels=in_channels, out_channels=1).cuda()
-        unet_optimizer = torch.optim.Adam(unet.parameters(), lr=0.001)
+
+        # Per-sensor UNet (range image resolution differs across sensors)
+        unets = {}
+        unet_optimizers = {}
+        for sname in scene.train_lidars:
+            unet = UNet(in_channels=in_channels, out_channels=1).cuda()
+            unets[sname] = unet
+            unet_optimizers[sname] = torch.optim.Adam(unet.parameters(), lr=0.001)
+
         for epoch in tqdm(range(0, args.refine.epochs), desc="Refine raydrop"):
             for iter in range(0, args.refine.batch_size):
                 if not frame_stack:
-                    frame_stack = list(scene.train_lidar.train_frames)
+                    frame_stack = [
+                        (sname, fid)
+                        for sname, lidar in scene.train_lidars.items()
+                        for fid in lidar.train_frames
+                    ]
                     random.shuffle(frame_stack)
-                frame = frame_stack.pop()
+                sensor_name, frame = frame_stack.pop()
+                cur_lidar = scene.train_lidars[sensor_name]
+                unet = unets[sensor_name]
 
                 render_pkg = raytracing(
-                    frame, gaussians_assets, scene.train_lidar, background, args
+                    frame, gaussians_assets, cur_lidar, background, args
                 )
                 depth = render_pkg["depth"].detach()
                 intensity = render_pkg["intensity"].detach()
@@ -410,7 +432,7 @@ def training(args):
                     [input_raydrop, input_intensity, input_depth], dim=0
                 )
                 if args.refine.use_spatial:
-                    ray_o, ray_d = scene.train_lidar.get_range_rays(frame)
+                    ray_o, ray_d = cur_lidar.get_range_rays(frame)
                     raydrop_prob = torch.cat(
                         [raydrop_prob, ray_o.permute(2, 0, 1), ray_d.permute(2, 0, 1)],
                         dim=0,
@@ -426,7 +448,7 @@ def training(args):
 
                 raydrop_prob = raydrop_prob.reshape(-1, 1)
 
-                gt_mask = scene.train_lidar.get_mask(frame).cuda()
+                gt_mask = cur_lidar.get_mask(frame).cuda()
                 labels_idx = (
                     ~gt_mask
                 )  # (1, h, w) notice: hit is true (1). apply ~ to make idx 0 represent hit
@@ -441,10 +463,12 @@ def training(args):
 
                 loss_raydrop.backward()
 
-            unet_optimizer.step()
-            unet_optimizer.zero_grad()
+            for sname in scene.train_lidars:
+                unet_optimizers[sname].step()
+                unet_optimizers[sname].zero_grad()
 
-        torch.save(unet.state_dict(), os.path.join(output_dir, "models", "unet.pth"))
+        for sname, unet in unets.items():
+            torch.save(unet.state_dict(), os.path.join(output_dir, "models", f"unet_{sname}.pth"))
 
 
 def logging(log, output_dir):

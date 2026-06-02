@@ -56,33 +56,40 @@ def load_scene_fast(args):
 
     Skips: normal estimation, voxel downsampling, optimizer setup.
     Only loads: range images, transforms, bounding boxes.
+
+    Returns:
+        lidars: dict[str, LiDARSensor]
+        bboxes: dict[str, BoundingBox]
     """
     t0 = time.time()
 
     # Load raw LiDAR data (range images + transforms + bboxes)
     if getattr(args, "data_type", None) == "T4":
         from lib.dataloader import t4_loader
-        lidar, bboxes = t4_loader.load_t4_raw(args.source_dir, args)
+        lidars, bboxes = t4_loader.load_t4_raw(args.source_dir, args)
     elif "waymo" in args.source_dir:
         from lib.dataloader import waymo_loader
         lidar, bboxes = waymo_loader.load_waymo_raw(args.source_dir, args)
+        lidars = {"waymo_top": lidar}
     elif "kitti" in args.source_dir:
         from lib.dataloader import kitti_loader
         lidar, bboxes = kitti_loader.load_kitti_raw(args.source_dir, args)
+        lidars = {"kitti": lidar}
     else:
         raise ValueError("Unknown dataset type")
 
-    # Setup frame lists on lidar sensor
+    # Setup frame lists on all sensors
     frame_range = args.frame_length
     eval_frames = args.eval_frames
     train_frames = [
         fid for fid in range(frame_range[0], frame_range[1] + 1)
         if fid not in eval_frames
     ]
-    lidar.set_frames(train_frames, eval_frames)
+    for sensor_name, lidar in lidars.items():
+        lidar.set_frames(train_frames, eval_frames)
 
-    print(f"LiDAR data loaded in {time.time() - t0:.1f}s", flush=True)
-    return lidar, bboxes
+    print(f"LiDAR data loaded in {time.time() - t0:.1f}s ({len(lidars)} sensor(s))", flush=True)
+    return lidars, bboxes
 
 
 def load_gaussians_fast(model_path, num_gaussians, args):
@@ -136,15 +143,18 @@ def depth_to_colors(depth, vmin=0.0, vmax=120.0):
 
 def main():
     args = build_args()
-    save_path = args.rerun_save or "output/t4_test/vis_rerun.rrd"
+    data_type = getattr(args, "data_type", "unknown")
+    save_path = args.rerun_save or f"output/vis_rerun_{data_type.lower()}.rrd"
 
     # --- Init Rerun ---
-    rr.init("LiDAR-RT T4 Visualization")
+    rr.init(f"LiDAR-RT {data_type} Visualization")
     rr.save(save_path)
     print(f"Saving to {save_path}", flush=True)
 
     # --- Load data (fast path) ---
-    lidar, bboxes = load_scene_fast(args)
+    lidars, bboxes = load_scene_fast(args)
+    sensor_names = list(lidars.keys())
+    multi_sensor = len(sensor_names) > 1
 
     # Determine number of gaussian models from checkpoint
     checkpoint = torch.load(args.model_path, map_location="cpu", weights_only=False)
@@ -153,13 +163,26 @@ def main():
 
     gaussians, first_iter = load_gaussians_fast(args.model_path, num_gaussians, args)
 
-    # Load UNet
-    unet = None
-    if args.unet and os.path.exists(args.unet):
+    # Load per-sensor UNets
+    unets = {}
+    if args.unet:
         in_channels = 9 if args.refine.use_spatial else 3
-        unet = UNet(in_channels=in_channels, out_channels=1).cuda()
-        unet.load_state_dict(torch.load(args.unet))
-        print("Loaded UNet", flush=True)
+        if os.path.isfile(args.unet):
+            # Single unet file: apply to first sensor
+            unet = UNet(in_channels=in_channels, out_channels=1).cuda()
+            unet.load_state_dict(torch.load(args.unet))
+            unets[sensor_names[0]] = unet
+            print(f"Loaded UNet for {sensor_names[0]}", flush=True)
+        else:
+            # Look for per-sensor unet files
+            unet_dir = args.unet if os.path.isdir(args.unet) else os.path.dirname(args.model_path)
+            for sname in sensor_names:
+                unet_path = os.path.join(unet_dir, f"unet_{sname}.pth")
+                if os.path.exists(unet_path):
+                    unet = UNet(in_channels=in_channels, out_channels=1).cuda()
+                    unet.load_state_dict(torch.load(unet_path))
+                    unets[sname] = unet
+                    print(f"Loaded UNet for {sname}", flush=True)
 
     background = torch.tensor([0, 0, 1], device="cuda").float()
 
@@ -173,16 +196,30 @@ def main():
     else:
         all_frames = list(range(args.frame_length[0], args.frame_length[1] + 1))
 
-    print(f"Rendering {len(all_frames)} frames...", flush=True)
+    print(f"Rendering {len(all_frames)} frames x {len(sensor_names)} sensor(s)...", flush=True)
 
     # --- Static logging ---
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
     rr.log("metadata", rr.TextDocument(
         f"Model: {args.model_path}\nIteration: {first_iter}\n"
-        f"Frames: {len(all_frames)} ({args.eval_type})"
+        f"Frames: {len(all_frames)} ({args.eval_type})\n"
+        f"Sensors: {', '.join(sensor_names)}"
     ))
 
-    # --- Blueprint: 3D view large, range images on the right ---
+    # --- Blueprint: 3D view + per-sensor range image panels ---
+    range_image_views = []
+    for sname in sensor_names:
+        prefix = f"range_image/{sname}" if multi_sensor else "range_image"
+        range_image_views.extend([
+            rrb.Spatial2DView(name=f"Depth GT ({sname})" if multi_sensor else "Depth GT",
+                              contents=f"{prefix}/depth/gt/**"),
+            rrb.Spatial2DView(name=f"Depth Rendered ({sname})" if multi_sensor else "Depth Rendered",
+                              contents=f"{prefix}/depth/rendered/**"),
+        ])
+    range_image_views.append(
+        rrb.TimeSeriesView(name="Depth Error (m/point)", contents="metrics/**"),
+    )
+
     blueprint = rrb.Blueprint(
         rrb.Horizontal(
             rrb.Vertical(
@@ -201,13 +238,8 @@ def main():
                 row_shares=[1],
             ),
             rrb.Vertical(
-                rrb.Spatial2DView(name="Depth GT", contents="range_image/depth/gt/**"),
-                rrb.Spatial2DView(name="Depth Rendered", contents="range_image/depth/rendered/**"),
-                rrb.Spatial2DView(name="Intensity GT", contents="range_image/intensity/gt/**"),
-                rrb.Spatial2DView(name="Intensity Rendered", contents="range_image/intensity/rendered/**"),
-                rrb.Spatial2DView(name="Depth Error (per-point, 0-5m)", contents="range_image/depth_error/**"),
-                rrb.TimeSeriesView(name="Depth Error (m/point)", contents="metrics/**"),
-                row_shares=[1, 1, 1, 1, 1, 1],
+                *range_image_views,
+                row_shares=[1] * len(range_image_views),
             ),
             column_shares=[3, 1],
         ),
@@ -217,68 +249,116 @@ def main():
     )
     rr.send_blueprint(blueprint)
 
-    # --- Compute origin offset from first frame's ego position ---
-    first_ego = lidar.ego2world[all_frames[0]]
+    # --- Compute origin offset from first frame's ego position (first sensor) ---
+    first_lidar = lidars[sensor_names[0]]
+    first_ego = first_lidar.ego2world[all_frames[0]]
     if torch.is_tensor(first_ego):
         first_ego = first_ego.cpu().numpy()
     origin_offset = first_ego[:3, 3].copy()
     print(f"Origin offset (first frame ego): {origin_offset}", flush=True)
+
+    # Per-sensor colors for 3D points
+    SENSOR_COLORS = [
+        [255, 255, 255],  # white
+        [0, 200, 255],    # cyan
+        [255, 200, 0],    # yellow
+        [200, 100, 255],  # purple
+        [255, 100, 100],  # light red
+        [100, 255, 100],  # light green
+    ]
 
     # --- Render loop ---
     t_render = time.time()
     for frame_id in tqdm(all_frames, desc="Rendering"):
         rr.set_time_sequence("frame", frame_id)
 
-        # Ray tracing
-        rendered_pkg = raytracing(frame_id, gaussians, lidar, background, args)
-        rendered_depth = rendered_pkg["depth"].detach()
-        rendered_intensity = rendered_pkg["intensity"].detach()
-        rendered_raydrop = rendered_pkg["raydrop"].detach()
+        all_gt_pts_frame = []
+        all_gt_colors_frame = []
+        all_rd_pts_frame = []
+        all_rd_colors_frame = []
+        frame_mae_values = []
 
-        # UNet refinement
-        if unet:
-            H, W = rendered_depth.shape[0], rendered_depth.shape[1]
-            inp = torch.cat([
-                rendered_raydrop.reshape(1, H, W),
-                rendered_intensity.reshape(1, H, W),
-                rendered_depth.reshape(1, H, W),
-            ], dim=0)
-            if args.refine.use_spatial:
-                ray_o, ray_d = lidar.get_range_rays(frame_id)
-                inp = torch.cat([inp, ray_o.permute(2, 0, 1), ray_d.permute(2, 0, 1)], dim=0)
-            rendered_raydrop = unet(inp.unsqueeze(0)).detach().reshape(H, W, 1)
+        for si, sensor_name in enumerate(sensor_names):
+            lidar = lidars[sensor_name]
+            unet = unets.get(sensor_name)
+            ri_prefix = f"range_image/{sensor_name}" if multi_sensor else "range_image"
+            sensor_color = SENSOR_COLORS[si % len(SENSOR_COLORS)]
 
-        # Ground truth
-        gt_rayhit = lidar.get_mask(frame_id).unsqueeze(-1)
-        gt_depth = lidar.get_depth(frame_id)
-        gt_intensity = lidar.get_intensity(frame_id).clamp(0, 1)
+            # Ray tracing
+            rendered_pkg = raytracing(frame_id, gaussians, lidar, background, args)
+            rendered_depth = rendered_pkg["depth"].detach()
+            rendered_intensity = rendered_pkg["intensity"].detach()
+            rendered_raydrop = rendered_pkg["raydrop"].detach()
 
-        gt_rayhit_np = gt_rayhit.cpu().numpy()
-        gt_depth_np = gt_depth.unsqueeze(-1).cpu().numpy()
-        gt_intensity_np = gt_intensity.unsqueeze(-1).cpu().numpy()
-        rendered_rayhit_np = (rendered_raydrop < RAYDROP_RATIO).cpu().numpy()
-        rendered_depth_np = rendered_depth.cpu().numpy()
-        rendered_intensity_np = rendered_intensity.clamp(0, 1).cpu().numpy()
-        mask = rendered_rayhit_np
+            # UNet refinement
+            if unet:
+                H, W = rendered_depth.shape[0], rendered_depth.shape[1]
+                inp = torch.cat([
+                    rendered_raydrop.reshape(1, H, W),
+                    rendered_intensity.reshape(1, H, W),
+                    rendered_depth.reshape(1, H, W),
+                ], dim=0)
+                if args.refine.use_spatial:
+                    ray_o, ray_d = lidar.get_range_rays(frame_id)
+                    inp = torch.cat([inp, ray_o.permute(2, 0, 1), ray_d.permute(2, 0, 1)], dim=0)
+                rendered_raydrop = unet(inp.unsqueeze(0)).detach().reshape(H, W, 1)
 
-        # 3D point clouds: get all (H,W,3) points, then filter by mask in numpy
-        gt_all_pts = lidar.range2point(frame_id, gt_depth_np).cpu().numpy().astype(np.float64)
-        rd_all_pts = lidar.range2point(frame_id, rendered_depth_np).cpu().numpy().astype(np.float64)
+            # Ground truth
+            gt_rayhit = lidar.get_mask(frame_id).unsqueeze(-1)
+            gt_depth = lidar.get_depth(frame_id)
+            gt_intensity = lidar.get_intensity(frame_id).clamp(0, 1)
 
-        gt_mask_2d = gt_rayhit_np.squeeze(-1).astype(bool)
-        rd_mask_2d = mask.squeeze(-1).astype(bool)
+            gt_rayhit_np = gt_rayhit.cpu().numpy()
+            gt_depth_np = gt_depth.unsqueeze(-1).cpu().numpy()
+            gt_intensity_np = gt_intensity.unsqueeze(-1).cpu().numpy()
+            rendered_rayhit_np = (rendered_raydrop < RAYDROP_RATIO).cpu().numpy()
+            rendered_depth_np = rendered_depth.cpu().numpy()
+            rendered_intensity_np = rendered_intensity.clamp(0, 1).cpu().numpy()
+            mask = rendered_rayhit_np
 
-        gt_pts = gt_all_pts[gt_mask_2d] - origin_offset
-        rendered_pts = rd_all_pts[rd_mask_2d] - origin_offset
+            # 3D point clouds
+            gt_all_pts = lidar.range2point(frame_id, gt_depth_np).cpu().numpy().astype(np.float64)
+            rd_all_pts = lidar.range2point(frame_id, rendered_depth_np).cpu().numpy().astype(np.float64)
 
-        gt_colors = np.full((len(gt_pts), 3), [255, 255, 255], dtype=np.uint8)
-        rendered_colors = np.full((len(rendered_pts), 3), [0, 255, 0], dtype=np.uint8)
+            gt_mask_2d = gt_rayhit_np.squeeze(-1).astype(bool)
+            rd_mask_2d = mask.squeeze(-1).astype(bool)
 
-        rr.log("world/pointcloud/gt", rr.Points3D(gt_pts, colors=gt_colors, radii=0.05))
-        rr.log("world/pointcloud/rendered", rr.Points3D(rendered_pts, colors=rendered_colors, radii=0.05))
+            gt_pts = gt_all_pts[gt_mask_2d] - origin_offset
+            rendered_pts = rd_all_pts[rd_mask_2d] - origin_offset
 
-        # Ego position
-        ego2world = lidar.ego2world[frame_id]
+            # Per-sensor 3D points
+            rr.log(f"world/pointcloud/gt/{sensor_name}",
+                    rr.Points3D(gt_pts, colors=[sensor_color] * len(gt_pts), radii=0.05))
+            rr.log(f"world/pointcloud/rendered/{sensor_name}",
+                    rr.Points3D(rendered_pts, colors=[[0, 255, 0]] * len(rendered_pts), radii=0.05))
+
+            # Range images
+            dmin = float(gt_depth_np[gt_mask_2d].min()) if gt_mask_2d.any() else 0.0
+            dmax = float(gt_depth_np.max())
+
+            gt_dvis = depth_to_colormap(gt_depth_np.squeeze(-1), dmin, dmax) * gt_rayhit_np.astype(np.uint8)
+            rd_masked = rendered_depth_np * mask
+            rd_vis = depth_to_colormap(rd_masked.squeeze(-1), dmin, dmax) * (mask & (rendered_depth_np > 0)).astype(np.uint8)
+            rr.log(f"{ri_prefix}/depth/gt", rr.Image(gt_dvis))
+            rr.log(f"{ri_prefix}/depth/rendered", rr.Image(rd_vis))
+
+            gt_ivis = intensity_to_colormap(gt_intensity_np.squeeze(-1)) * gt_rayhit_np.astype(np.uint8)
+            ri_vis = intensity_to_colormap(rendered_intensity_np.squeeze(-1)) * mask.astype(np.uint8)
+            rr.log(f"{ri_prefix}/intensity/gt", rr.Image(gt_ivis))
+            rr.log(f"{ri_prefix}/intensity/rendered", rr.Image(ri_vis))
+
+            # Per-sensor depth error
+            valid = (gt_rayhit_np.squeeze(-1) > 0) & (rd_masked.squeeze(-1) > 0)
+            if valid.any():
+                err_map = np.zeros_like(gt_depth_np.squeeze(-1))
+                err_map[valid] = np.abs(gt_depth_np.squeeze(-1)[valid] - rd_masked.squeeze(-1)[valid])
+                err = err_map[valid]
+                frame_mae_values.append(float(err.mean()))
+                if multi_sensor:
+                    rr.log(f"metrics/MAE_{sensor_name}", rr.Scalars(float(err.mean())))
+
+        # Ego position (from first sensor)
+        ego2world = first_lidar.ego2world[frame_id]
         if torch.is_tensor(ego2world):
             ego2world = ego2world.cpu().numpy()
         rr.log("world/ego", rr.Points3D([ego2world[:3, 3] - origin_offset], colors=[[255, 0, 0]], radii=[0.5]))
@@ -290,9 +370,12 @@ def main():
                 pos, quat, _, _ = bbox.frame[frame_id]
                 centers.append(pos.cpu().numpy() - origin_offset)
                 s = bbox.size.cpu().numpy()
-                sizes.append(s[[1, 0, 2]])  # T4 [width,length,height] -> [length,width,height]
+                if data_type == "T4":
+                    sizes.append(s[[1, 0, 2]])
+                else:
+                    sizes.append(s)
                 q_wxyz = quat.squeeze(0).cpu().numpy()
-                quats.append(q_wxyz[[1, 2, 3, 0]])  # wxyz -> xyzw for Rerun
+                quats.append(q_wxyz[[1, 2, 3, 0]])
                 labels.append(str(obj_id)[:8])
         if centers:
             rr.log("world/bboxes", rr.Boxes3D(
@@ -301,42 +384,9 @@ def main():
                 colors=[[0, 255, 0]] * len(centers),
             ))
 
-        # Range images
-        dmin = float(gt_depth_np[gt_rayhit_np.squeeze(-1) > 0].min()) if gt_rayhit_np.any() else 0.0
-        dmax = float(gt_depth_np.max())
-
-        gt_dvis = depth_to_colormap(gt_depth_np.squeeze(-1), dmin, dmax) * gt_rayhit_np.astype(np.uint8)
-        rd_masked = rendered_depth_np * mask
-        rd_vis = depth_to_colormap(rd_masked.squeeze(-1), dmin, dmax) * (mask & (rendered_depth_np > 0)).astype(np.uint8)
-        rr.log("range_image/depth/gt", rr.Image(gt_dvis))
-        rr.log("range_image/depth/rendered", rr.Image(rd_vis))
-
-        gt_ivis = intensity_to_colormap(gt_intensity_np.squeeze(-1)) * gt_rayhit_np.astype(np.uint8)
-        ri_vis = intensity_to_colormap(rendered_intensity_np.squeeze(-1)) * mask.astype(np.uint8)
-        rr.log("range_image/intensity/gt", rr.Image(gt_ivis))
-        rr.log("range_image/intensity/rendered", rr.Image(ri_vis))
-
-        gt_mvis = (gt_rayhit_np.squeeze(-1) * 255).astype(np.uint8)
-        rd_mvis = (rendered_rayhit_np.squeeze(-1) * 255).astype(np.uint8)
-        rr.log("range_image/rayhit/gt", rr.Image(np.stack([gt_mvis]*3, axis=-1)))
-        rr.log("range_image/rayhit/rendered", rr.Image(np.stack([rd_mvis]*3, axis=-1)))
-
-        # Depth error as raw float for hover
-        rr.log("range_image/depth_raw/gt", rr.DepthImage(gt_depth_np.squeeze(-1), meter=1.0))
-        rr.log("range_image/depth_raw/rendered", rr.DepthImage(rd_masked.squeeze(-1), meter=1.0))
-
-        # Per-frame metrics (per-point error image + scalar stats)
-        valid = (gt_rayhit_np.squeeze(-1) > 0) & (rd_masked.squeeze(-1) > 0)
-        if valid.any():
-            err_map = np.zeros_like(gt_depth_np.squeeze(-1))
-            err_map[valid] = np.abs(gt_depth_np.squeeze(-1)[valid] - rd_masked.squeeze(-1)[valid])
-            # Per-point depth error as heatmap (meters)
-            err_vis = depth_to_colormap(err_map, 0.0, 5.0) * valid[..., None].astype(np.uint8)
-            rr.log("range_image/depth_error", rr.Image(err_vis))
-            # Scalar stats
-            err = err_map[valid]
-            rr.log("metrics/MAE (m/point)", rr.Scalars(float(err.mean())))
-            rr.log("metrics/RMSE (m/point)", rr.Scalars(float(np.sqrt((err**2).mean()))))
+        # Aggregate metrics
+        if frame_mae_values:
+            rr.log("metrics/MAE (m/point)", rr.Scalars(float(np.mean(frame_mae_values))))
 
         frame_label = "EVAL" if frame_id in eval_frames else "TRAIN"
         rr.log("metadata/frame_type", rr.TextDocument(f"Frame {frame_id} ({frame_label})"))
