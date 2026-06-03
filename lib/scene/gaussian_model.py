@@ -353,7 +353,8 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
         return num
 
-    def densify_and_prune(self, opt, min_opacity, max_screen_size):
+    def densify_and_prune(self, opt, min_opacity, max_screen_size,
+                          sensor_centers=None, min_range_prune=0.0):
         mean_grads = (self.xyz_gradient_accum / self.denom).nan_to_num(0.0).squeeze(-1)
 
         clone_num = self.densify_and_clone(mean_grads, opt.densify_grad_threshold)
@@ -364,13 +365,37 @@ class GaussianModel:
         prune_mask = low_opacity
         prune_opacity_num = low_opacity.sum().item()
         prune_scale_num = 0
+
+        # Hard prune: object Gaussians whose center has escaped the bbox.
+        # Runs every densification step (not gated by max_screen_size) so
+        # bbox-escaping Gaussians cannot accumulate during early training.
+        if self.bounding_box is not None:
+            center_outside = torch.logical_or(
+                (self.get_local_xyz < self.bounding_box.min_xyz).any(dim=-1),
+                (self.get_local_xyz > self.bounding_box.max_xyz).any(dim=-1),
+            )
+            prune_mask = torch.logical_or(prune_mask, center_outside)
+            print(f'Hard prune centers outside bbox: {center_outside.sum().item()}')
+
+        # Hard prune background Gaussians within min_range_prune of any sensor.
+        # Below the LiDAR's minimum measurable range no real returns exist, so
+        # these are necessarily phantom Gaussians (object Gaussians are handled
+        # via the bbox check above and skipped here).
+        if (self.bounding_box is None and sensor_centers is not None
+                and min_range_prune > 0 and self.get_local_xyz.shape[0] > 0):
+            dists = torch.cdist(self.get_local_xyz, sensor_centers.to(self.get_local_xyz.device))
+            min_dist = dists.min(dim=1).values
+            too_close = min_dist < min_range_prune
+            prune_mask = torch.logical_or(prune_mask, too_close)
+            print(f'Hard prune too-close-to-sensor (<{min_range_prune}m): {too_close.sum().item()}')
+
         if max_screen_size:
 
             #big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * self.extent * opt.prune_size_threshold
             prune_scale_num = big_points_ws.sum().item()
             #prune_mask = torch.logical_or(prune_mask, big_points_vs)
-            prune_mask = torch.logical_or(low_opacity, big_points_ws)
+            prune_mask = torch.logical_or(prune_mask, big_points_ws)
             print(f'Prune big points in world: {prune_scale_num} lower than min opacity: {prune_opacity_num}')
 
             if self.bounding_box is not None:

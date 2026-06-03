@@ -18,6 +18,39 @@ import matplotlib
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
 
+
+def colorize_depth(depth_np, vmin, vmax, mask=None):
+    """Colorize a depth map with cv2 JET colormap. Returns BGR uint8.
+
+    Behavior is identical between training-time and offline visualization:
+    linear map [vmin, vmax] → [0, 255], no internal renormalization. Masked
+    pixels are set to black. Use cv2.cvtColor(..., cv2.COLOR_BGR2RGB) when
+    feeding the result to rerun or wandb.
+    """
+    if depth_np.ndim == 3 and depth_np.shape[-1] == 1:
+        depth_np = depth_np.squeeze(-1)
+    drange = max(vmax - vmin, 1e-6)
+    norm = np.clip((depth_np - vmin) / drange, 0.0, 1.0)
+    img = cv2.applyColorMap(np.uint8(norm * 255), cv2.COLORMAP_JET)
+    if mask is not None:
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+        img[~mask.astype(bool)] = 0
+    return img
+
+
+def colorize_intensity(intensity_np, mask=None):
+    """Colorize an intensity map (0-1) with cv2 JET colormap. Returns BGR uint8."""
+    if intensity_np.ndim == 3 and intensity_np.shape[-1] == 1:
+        intensity_np = intensity_np.squeeze(-1)
+    norm = np.clip(intensity_np, 0.0, 1.0)
+    img = cv2.applyColorMap(np.uint8(norm * 255), cv2.COLORMAP_JET)
+    if mask is not None:
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+        img[~mask.astype(bool)] = 0
+    return img
+
 def psnr(img1, img2):
     mse = (((img1 - img2)) ** 2).mean()
     return 20 * torch.log10(1.0 / torch.sqrt(mse))

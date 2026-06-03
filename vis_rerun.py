@@ -23,7 +23,7 @@ from lib.arguments import parse
 from lib.gaussian_renderer import raytracing
 from lib.scene import BoundingBox, GaussianModel, LiDARSensor
 from lib.scene.unet import UNet
-from lib.utils.image_utils import color_mapping
+from lib.utils.image_utils import color_mapping, colorize_depth, colorize_intensity
 from tqdm import tqdm
 
 RAYDROP_RATIO = 0.5
@@ -341,26 +341,45 @@ def main():
             rr.log(f"world/pointcloud/rendered/{sensor_name}",
                     rr.Points3D(rendered_pts, colors=[[0, 255, 0]] * len(rendered_pts), radii=0.05))
 
-            # Range images
-            dmin = float(gt_depth_np[gt_mask_2d].min()) if gt_mask_2d.any() else 0.0
-            dmax = float(gt_depth_np.max())
+            # Range images. Same masks/colormap as the wandb visualization in
+            # train.py: GT uses gt_mask, pred uses depth>0 (any Gaussian hit).
+            # Note this intentionally ignores the UNet-refined raydrop here so
+            # both viewers show the same picture; the raydrop-filtered point
+            # cloud is still logged separately above.
+            dmin = 0.0
+            dmax = max(float(gt_depth_np.max()), float(rendered_depth_np.max()))
 
-            gt_dvis = depth_to_colormap(gt_depth_np.squeeze(-1), dmin, dmax) * gt_rayhit_np.astype(np.uint8)
-            rd_masked = rendered_depth_np * mask
-            rd_vis = depth_to_colormap(rd_masked.squeeze(-1), dmin, dmax) * (mask & (rendered_depth_np > 0)).astype(np.uint8)
+            gt_depth_2d = gt_depth_np.squeeze(-1)
+            rd_depth_2d = rendered_depth_np.squeeze(-1)
+            pred_hit_any = rd_depth_2d > 0
+
+            # colorize_depth returns BGR; rerun expects RGB
+            gt_dvis = cv2.cvtColor(
+                colorize_depth(gt_depth_2d, dmin, dmax, mask=gt_mask_2d), cv2.COLOR_BGR2RGB
+            )
+            rd_vis = cv2.cvtColor(
+                colorize_depth(rd_depth_2d, dmin, dmax, mask=pred_hit_any), cv2.COLOR_BGR2RGB
+            )
             rr.log(f"{ri_prefix}/depth/gt", rr.Image(gt_dvis))
             rr.log(f"{ri_prefix}/depth/rendered", rr.Image(rd_vis))
 
-            gt_ivis = intensity_to_colormap(gt_intensity_np.squeeze(-1)) * gt_rayhit_np.astype(np.uint8)
-            ri_vis = intensity_to_colormap(rendered_intensity_np.squeeze(-1)) * mask.astype(np.uint8)
+            gt_ivis = cv2.cvtColor(
+                colorize_intensity(gt_intensity_np.squeeze(-1), mask=gt_mask_2d), cv2.COLOR_BGR2RGB
+            )
+            ri_vis = cv2.cvtColor(
+                colorize_intensity(rendered_intensity_np.squeeze(-1), mask=pred_hit_any), cv2.COLOR_BGR2RGB
+            )
             rr.log(f"{ri_prefix}/intensity/gt", rr.Image(gt_ivis))
             rr.log(f"{ri_prefix}/intensity/rendered", rr.Image(ri_vis))
 
-            # Per-sensor depth error
-            valid = (gt_rayhit_np.squeeze(-1) > 0) & (rd_masked.squeeze(-1) > 0)
+            # Per-sensor depth error. Keep using the raydrop-filtered pred
+            # depth here (= simulated LiDAR output) so MAE reflects post-UNet
+            # quality, not raw Gaussian rendering.
+            rd_filtered = rd_depth_2d * mask.squeeze(-1)
+            valid = (gt_rayhit_np.squeeze(-1) > 0) & (rd_filtered > 0)
             if valid.any():
                 err_map = np.zeros_like(gt_depth_np.squeeze(-1))
-                err_map[valid] = np.abs(gt_depth_np.squeeze(-1)[valid] - rd_masked.squeeze(-1)[valid])
+                err_map[valid] = np.abs(gt_depth_np.squeeze(-1)[valid] - rd_filtered[valid])
                 err = err_map[valid]
                 frame_mae_values.append(float(err.mean()))
                 if multi_sensor:

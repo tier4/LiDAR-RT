@@ -28,7 +28,7 @@ from lib.scene import Scene
 from lib.scene.unet import UNet
 from lib.utils.chamfer3D.dist_chamfer_3D import chamfer_3DDist
 from lib.utils.console_utils import *
-from lib.utils.image_utils import mse, psnr
+from lib.utils.image_utils import mse, psnr, colorize_depth, colorize_intensity
 from lib.utils.loss_utils import (
     BinaryCrossEntropyLoss,
     BinaryFocalLoss,
@@ -121,6 +121,9 @@ def training(args):
             "lambda_cd": getattr(args.opt, "lambda_cd", None),
             "lambda_reg": getattr(args.opt, "lambda_reg", None),
             "lambda_sky": getattr(args.opt, "lambda_sky", None),
+            "lambda_near": getattr(args.opt, "lambda_near", None),
+            "min_range_prune": getattr(args.opt, "min_range_prune", None),
+            "min_range_push": getattr(args.opt, "min_range_push", None),
             "max_depth": getattr(args, "max_depth", None),
             "densify_until_iter": getattr(args.opt, "densify_until_iter", None),
             "densify_from_iter": getattr(args.opt, "densify_from_iter", None),
@@ -271,7 +274,23 @@ def training(args):
         else:
             loss_sky = torch.tensor(0.0, device="cuda")
 
-        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky
+        # === near-range push loss ===
+        # Soft hinge: penalize any rendered depth below the LiDAR's effective
+        # minimum range, pushing Gaussians away from the sensor's blind zone.
+        # depth=0 (no Gaussian hit) is ignored.
+        lambda_near = getattr(args.opt, "lambda_near", 0.0)
+        min_range_push = getattr(args.opt, "min_range_push", 0.0)
+        if lambda_near > 0 and min_range_push > 0:
+            valid = depth > 0
+            if valid.any():
+                violation = torch.clamp(min_range_push - depth, min=0.0)
+                loss_near = lambda_near * violation[valid].mean()
+            else:
+                loss_near = torch.tensor(0.0, device="cuda")
+        else:
+            loss_near = torch.tensor(0.0, device="cuda")
+
+        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_near
 
         # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
         if not torch.isfinite(loss):
@@ -401,6 +420,8 @@ def training(args):
                         "train/reg_loss": loss_reg.item() if isinstance(loss_reg, torch.Tensor) else loss_reg,
                         # Sky transparency
                         "train/sky_loss": loss_sky.item(),
+                        # Near-range push
+                        "train/near_loss": loss_near.item(),
                         # Densification
                         "train/points_num": points_num,
                         "train/clone_sum": clone_sum,
@@ -424,24 +445,47 @@ def training(args):
                 )
                 rendered_depth = render_pkg["depth"]
                 rendered_intensity = render_pkg["intensity"]
+                rendered_raydrop = render_pkg["raydrop"]
 
-                rendered_depth = (rendered_depth - rendered_depth.min()) / (
-                    rendered_depth.max() - rendered_depth.min()
-                )
-                rendered_depth = rendered_depth.cpu().numpy()
-                rendered_depth = np.uint8(rendered_depth * 255)
-                rendered_depth = cv2.applyColorMap(rendered_depth, color)
+                # GT for side-by-side comparison
+                gt_depth_viz = scene.train_lidar.get_depth(frame_s).cuda()
+                gt_mask_viz = scene.train_lidar.get_mask(frame_s).cuda()
 
-                rendered_intensity = rendered_intensity.clamp(0, 1)
-                rendered_intensity = (rendered_intensity - rendered_intensity.min()) / (
-                    rendered_intensity.max() - rendered_intensity.min()
+                # Use 0..max(GT, rendered) so near-range phantom Gaussians (depth
+                # below GT's minimum) are still visible in the colormap rather
+                # than getting clipped to the darkest color.
+                if gt_mask_viz.any():
+                    dmax = max(
+                        float(gt_depth_viz.max().item()),
+                        float(rendered_depth.max().item()),
+                    )
+                else:
+                    dmax = float(rendered_depth.max().item())
+                dmin = 0.0
+
+                # Predicted hit mask: any Gaussian intercepted the ray. We
+                # deliberately do NOT filter by the raw raydrop classifier here
+                # — vis_rerun.py uses the same mask to keep the two viewers in
+                # sync (UNet refinement is post-training and unavailable mid-run).
+                rendered_depth_2d = rendered_depth.squeeze(-1).detach().cpu().numpy()
+                gt_depth_np = gt_depth_viz.detach().cpu().numpy()
+                gt_mask_np = gt_mask_viz.detach().cpu().numpy().astype(bool)
+                pred_hit_any = rendered_depth_2d > 0
+
+                gt_depth_img = colorize_depth(gt_depth_np, dmin, dmax, mask=gt_mask_np)
+                pred_depth_img = colorize_depth(rendered_depth_2d, dmin, dmax, mask=pred_hit_any)
+                # Sky-violation: GT says no return but a Gaussian intercepted
+                # the ray (depth>0). Directly shows phantom Gaussian artifacts.
+                sky_violation_mask = pred_hit_any & (~gt_mask_np)
+                sky_violation_img = colorize_depth(
+                    rendered_depth_2d, dmin, dmax, mask=sky_violation_mask
                 )
-                rendered_intensity = rendered_intensity.cpu().numpy()
-                rendered_intensity = np.uint8(rendered_intensity * 255)
-                rendered_intensity = cv2.applyColorMap(rendered_intensity, color)
+
+                rendered_intensity_np = rendered_intensity.clamp(0, 1).detach().cpu().numpy()
+                rendered_intensity_vis = colorize_intensity(rendered_intensity_np)
 
                 concat_image = np.concatenate(
-                    [rendered_depth, rendered_intensity], axis=0
+                    [gt_depth_img, pred_depth_img, sky_violation_img, rendered_intensity_vis], axis=0
                 )
                 rgb_image = concat_image
                 os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
@@ -450,6 +494,19 @@ def training(args):
                     rgb_image,
                 )
                 render_cams.append(rgb_image)
+
+                if WANDB_FOUND:
+                    # cv2 returns BGR; wandb expects RGB
+                    wandb.log({
+                        "viz/depth_compare": wandb.Image(
+                            cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB),
+                            caption=(
+                                f"iter {iteration} | top→bot: "
+                                "gt_depth (gt_mask) / pred_depth (any hit) / "
+                                "sky_violation (pred hit on sky pixel) / pred_intensity"
+                            ),
+                        ),
+                    }, step=iteration)
 
             # Progress bar
             ema_loss_for_log = 0.4 * loss + 0.6 * ema_loss_for_log

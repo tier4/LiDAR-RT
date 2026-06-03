@@ -305,8 +305,19 @@ class SceneLidar(Scene):
                     size_threshold = (
                         20 if iteration > args.opt.opacity_reset_interval else None
                     )
+                    # Gather all training-frame sensor centers (background-only prune)
+                    sensor_centers = None
+                    if gaussians.bounding_box is None:
+                        center_list = []
+                        for lidar in self.train_lidars.values():
+                            for c in lidar.sensor_center.values():
+                                center_list.append(c)
+                        if center_list:
+                            sensor_centers = torch.stack(center_list).cuda()
                     densify_info = gaussians.densify_and_prune(
-                        args.opt, 0.005, size_threshold
+                        args.opt, 0.005, size_threshold,
+                        sensor_centers=sensor_centers,
+                        min_range_prune=getattr(args.opt, "min_range_prune", 0.0),
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
