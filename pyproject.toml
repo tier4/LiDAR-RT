@@ -30,6 +30,8 @@ dependencies = [
     "termcolor>=2.0.0",
     "t4-devkit>=0.7.1",
     "wandb>=0.16.0",
+    "simple_knn",
+    "diff_lidar_tracer",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -38,9 +40,16 @@ classifiers = [
 
 [tool.uv]
 find-links = ["https://download.pytorch.org/whl/cu121"]
+no-build-isolation-package = ["simple_knn", "diff_lidar_tracer"]
 
 [tool.uv.sources]
 t4-devkit = { git = "https://github.com/tier4/t4-devkit.git", rev = "4da7fd576a53165b3ce7090c45af4ce85eaaf80c" }
+simple_knn = { path = "submodules/simple-knn" }
+diff_lidar_tracer = { path = "submodules/diff-lidar-tracer" }
+
+[tool.uv.extra-build-variables]
+simple_knn = { TORCH_CUDA_ARCH_LIST = "8.0;8.6;8.9;9.0" }
+diff_lidar_tracer = { TORCH_CUDA_ARCH_LIST = "8.0;8.6;8.9;9.0" }
 
 [project.urls]
 homepage = "https://zju3dv.github.io/lidar-rt"
