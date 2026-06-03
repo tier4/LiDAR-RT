@@ -21,3 +21,9 @@ lidar_sensors:
     max_depth: 200.0
 
 max_depth: 200.0
+
+# Visualization filter: hide rendered points/pixels with depth below this in
+# both wandb (train.py) and rerun (vis_rerun.py). The Hesai OT128 has a 0.3 m
+# hardware minimum but in practice the JPN Taxi mount never sees anything
+# below ~2.7 m, so anything closer is phantom.
+viz_min_depth: 1.0

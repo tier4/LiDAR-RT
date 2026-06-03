@@ -45,6 +45,7 @@ opt:
   lambda_near: 0.0
   min_range_prune: 0.0
   min_range_push: 0.0
+  sky_morph_kernel: 0
   use_rayhit: True
 
   use_normal_init: True

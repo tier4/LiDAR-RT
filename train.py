@@ -20,6 +20,7 @@ import numpy as np
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["CUDA_USE_CUDA_DSA"] = "1"
 import torch
+import torch.nn.functional as F
 import yaml
 from lib import dataloader
 from lib.arguments import parse
@@ -264,9 +265,26 @@ def training(args):
         # For sky-direction rays (no GT return), the rendered depth should be 0.
         # A non-zero rendered depth there means a phantom Gaussian intercepted
         # the ray; pushing depth toward 0 forces those Gaussians to thin out.
+        #
+        # We morphologically close gt_mask so isolated few-pixel "no return"
+        # spots (real ray-drops on glass, wet surfaces, low-reflectance, etc.
+        # — surrounded by hits) are treated as hits. Without this the sky
+        # loss would also suppress Gaussians at those genuine-drop pixels and
+        # rob the SH / intensity supervision of any learning signal there.
         lambda_sky = getattr(args.opt, "lambda_sky", 0.0)
+        sky_kernel = int(getattr(args.opt, "sky_morph_kernel", 3))
         if lambda_sky > 0:
-            sky_mask = ~gt_mask
+            if sky_kernel > 1:
+                # Fill small holes in gt_mask via morphological closing
+                # (dilation then erosion) implemented with max_pool2d.
+                gt_f = gt_mask.float().unsqueeze(0).unsqueeze(0)
+                pad = sky_kernel // 2
+                dilated = F.max_pool2d(gt_f, sky_kernel, stride=1, padding=pad)
+                closed = -F.max_pool2d(-dilated, sky_kernel, stride=1, padding=pad)
+                gt_mask_closed = closed.squeeze(0).squeeze(0) > 0.5
+                sky_mask = ~gt_mask_closed
+            else:
+                sky_mask = ~gt_mask
             if sky_mask.any():
                 loss_sky = lambda_sky * depth[sky_mask].abs().mean()
             else:
@@ -471,10 +489,13 @@ def training(args):
                 # deliberately do NOT filter by the raw raydrop classifier here
                 # — vis_rerun.py uses the same mask to keep the two viewers in
                 # sync (UNet refinement is post-training and unavailable mid-run).
+                # depth < viz_min_depth is filtered out as obvious phantom (the
+                # LiDAR's hardware minimum range is well above this).
                 rendered_depth_2d = rendered_depth.squeeze(-1).detach().cpu().numpy()
                 gt_depth_np = gt_depth_viz.detach().cpu().numpy()
                 gt_mask_np = gt_mask_viz.detach().cpu().numpy().astype(bool)
-                pred_hit_any = rendered_depth_2d > 0
+                viz_min_depth = float(getattr(args, "viz_min_depth", 0.0))
+                pred_hit_any = rendered_depth_2d > viz_min_depth
 
                 gt_depth_img = colorize_depth(gt_depth_np, dmin, dmax, mask=gt_mask_np)
                 pred_depth_img = colorize_depth(rendered_depth_2d, dmin, dmax, mask=pred_hit_any)

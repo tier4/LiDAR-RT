@@ -91,21 +91,22 @@ def render_frame(depth, vmax, weak_col_threshold=0.01, weak_hit_rate=0.5):
     panel_depth = colorize_depth(depth, vmax)
     panel_depth[~gt_mask] = 0  # mask depth==0 to black so structure is clearer
 
-    panel_hit = np.zeros((H, W, 3), dtype=np.uint8)
-    panel_hit[gt_mask] = 255
-
+    # sky_mask panel: WHITE = "no GT return" (LiDAR didn't come back),
+    # BLACK = pixel had a GT return.
     panel_sky = np.zeros((H, W, 3), dtype=np.uint8)
-    panel_sky[sky_mask] = 255  # WHITE = "no GT return" = where phantoms can hide
+    panel_sky[sky_mask] = 255
 
-    # Highlight columns whose downward-beam hit rate fell below threshold —
-    # these are the azimuth bands the drop detector flags as packet-loss.
+    # Drop indicator: tint columns flagged as weak with red, but ONLY at
+    # pixels that actually had a hit. We must not paint over the white
+    # sky_mask pixels — those are the answer to "where did LiDAR not return".
     if weak_mask.any():
-        red_overlay = weak_mask[None, :].repeat(H, axis=0)
-        panel_sky[red_overlay] = (0, 0, 255)  # BGR red
+        weak_2d = weak_mask[None, :].repeat(H, axis=0)
+        hit_in_weak = weak_2d & gt_mask
+        panel_sky[hit_in_weak] = (0, 0, 255)  # BGR red on top of black hits
 
     ruler = build_azimuth_ruler(W, H_strip=16)
 
-    out = np.concatenate([panel_depth, panel_hit, panel_sky, ruler], axis=0)
+    out = np.concatenate([panel_depth, panel_sky, ruler], axis=0)
 
     # Overlay frame-level stats
     sky_pct = 100 * sky_mask.mean()

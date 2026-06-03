@@ -352,12 +352,16 @@ def main():
             rendered_intensity_np = rendered_intensity.clamp(0, 1).cpu().numpy()
             mask = rendered_rayhit_np
 
-            # 3D point clouds
+            # 3D point clouds. Filter out unrealistic close-range hits so the
+            # rerun view does not show a cloud of points right next to the
+            # sensor. Default 0 = no filter; set to the LiDAR hardware-min
+            # range (e.g. 1.0 m) in the data config to enable.
+            viz_min_depth = float(getattr(args, "viz_min_depth", 0.0))
             gt_all_pts = lidar.range2point(frame_id, gt_depth_np).cpu().numpy().astype(np.float64)
             rd_all_pts = lidar.range2point(frame_id, rendered_depth_np).cpu().numpy().astype(np.float64)
 
             gt_mask_2d = gt_rayhit_np.squeeze(-1).astype(bool)
-            rd_mask_2d = (mask & (rendered_depth_np > 0)).squeeze(-1).astype(bool)
+            rd_mask_2d = (mask & (rendered_depth_np > viz_min_depth)).squeeze(-1).astype(bool)
 
             gt_pts = gt_all_pts[gt_mask_2d] - origin_offset
             rendered_pts = rd_all_pts[rd_mask_2d] - origin_offset
@@ -378,7 +382,7 @@ def main():
 
             gt_depth_2d = gt_depth_np.squeeze(-1)
             rd_depth_2d = rendered_depth_np.squeeze(-1)
-            pred_hit_any = rd_depth_2d > 0
+            pred_hit_any = rd_depth_2d > viz_min_depth
 
             # colorize_depth returns BGR; rerun expects RGB
             gt_dvis = cv2.cvtColor(
