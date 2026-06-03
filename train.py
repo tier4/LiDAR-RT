@@ -687,12 +687,20 @@ if __name__ == "__main__":
         action="store_true",
         help="skip the training. only refine the model. E.g. load a checkpoint and only refine the unet to fit the checkpoint",
     )
+    parser.add_argument(
+        "-s",
+        "--source_dir",
+        type=str,
+        help="override source_dir from data config",
+    )
     launch_args = parser.parse_args()
 
     args = parse(launch_args.exp_config_path)
     args = parse(launch_args.data_config_path, args)
     args.model_path = launch_args.model
     args.only_refine = launch_args.only_refine
+    if launch_args.source_dir:
+        args.source_dir = launch_args.source_dir
 
     if not os.path.exists(args.model_dir):
         os.makedirs(args.model_dir)
