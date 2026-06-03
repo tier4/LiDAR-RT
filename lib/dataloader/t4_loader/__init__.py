@@ -1,4 +1,3 @@
-import csv
 import math
 import os
 
@@ -12,10 +11,45 @@ from lib.utils.general_utils import matrix_to_quaternion
 from t4_devkit import T4Devkit
 from tqdm import tqdm
 
-# Directory containing Hesai angle correction CSV files
-_HESAI_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "hesai")
+# Hesai beam elevation tables (degrees), transcribed verbatim from the official
+# Angle Correction CSV files in `hesai_data/`. Values are listed in channel
+# order (channel 1 → end) as they appear in the CSVs.
+_HESAI_BEAM_TABLES_DEG = {
+    # OT128_Angle-Correction-File-1.csv (128 channels, non-uniform spacing).
+    "OT128": [
+        14.985, 13.283, 11.758, 10.483, 9.836, 9.171, 8.496, 7.812,
+        7.462, 7.115, 6.767, 6.416, 6.064, 5.71, 5.355, 4.998,
+        4.643, 4.282, 3.921, 3.558, 3.194, 2.829, 2.463, 2.095,
+        1.974, 1.854, 1.729, 1.609, 1.487, 1.362, 1.242, 1.12,
+        0.995, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125,
+        0.0, -0.125, -0.25, -0.375, -0.5, -0.626, -0.751, -0.876,
+        -1.001, -1.126, -1.251, -1.377, -1.502, -1.627, -1.751, -1.876,
+        -2.001, -2.126, -2.251, -2.376, -2.501, -2.626, -2.751, -2.876,
+        -3.001, -3.126, -3.251, -3.376, -3.501, -3.626, -3.751, -3.876,
+        -4.001, -4.126, -4.25, -4.375, -4.501, -4.626, -4.751, -4.876,
+        -5.001, -5.126, -5.252, -5.377, -5.502, -5.626, -5.752, -5.877,
+        -6.002, -6.378, -6.754, -7.13, -7.507, -7.882, -8.257, -8.632,
+        -9.003, -9.376, -9.749, -10.121, -10.493, -10.864, -11.234, -11.603,
+        -11.975, -12.343, -12.709, -13.075, -13.439, -13.803, -14.164, -14.525,
+        -14.879, -15.237, -15.593, -15.948, -16.299, -16.651, -17.0, -17.347,
+        -17.701, -18.386, -19.063, -19.73, -20.376, -21.653, -23.044, -24.765,
+    ],
+    # XT32_Angle_Correction_File-1.csv (32 channels, uniform 1° spacing).
+    "XT32": [
+        15.0, 14.0, 13.0, 12.0, 11.0, 10.0, 9.0, 8.0,
+        7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0,
+        -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0,
+        -9.0, -10.0, -11.0, -12.0, -13.0, -14.0, -15.0, -16.0,
+    ],
+    # XT16_Angle_Correction_File-1.csv (16 channels, uniform 2° spacing).
+    "XT16": [
+        15.0, 13.0, 11.0, 9.0, 7.0, 5.0, 3.0, 1.0,
+        -1.0, -3.0, -5.0, -7.0, -9.0, -11.0, -13.0, -15.0,
+    ],
+}
 
-# Beam table cache: sensor_type -> list of elevation angles in radians (top to bottom)
+# Beam table cache: sensor_type -> numpy array of elevation angles in radians,
+# sorted top (most positive) to bottom (most negative) — range image row order.
 _BEAM_TABLE_CACHE = {}
 
 # Ego vehicle crop box (base_link frame = rear axle center)
@@ -148,38 +182,21 @@ def _compute_ego_mask(sensor2ego, inclination_bounds, H, W):
 
 
 def _load_beam_table(sensor_type):
-    """Load beam elevation table from Hesai angle correction CSV.
+    """Return beam elevation table (radians, top→bottom) for a Hesai sensor.
 
-    Returns:
-        beam_elevations: numpy array of elevation angles in radians,
-                         sorted top (positive) to bottom (negative).
+    Tables are hardcoded from the official Hesai Angle Correction CSVs in
+    `hesai_data/`. Returns ``None`` for unknown sensor types.
     """
     if sensor_type in _BEAM_TABLE_CACHE:
         return _BEAM_TABLE_CACHE[sensor_type]
 
-    csv_map = {
-        "OT128": "OT128_Angle-Correction-File-1.csv",
-        "XT32": "XT32_Angle_Correction_File-1.csv",
-        "XT16": "XT16_Angle_Correction_File-1.csv",
-    }
-    filename = csv_map.get(sensor_type)
-    if filename is None:
+    elevations_deg = _HESAI_BEAM_TABLES_DEG.get(sensor_type)
+    if elevations_deg is None:
         return None
 
-    csv_path = os.path.join(_HESAI_DATA_DIR, filename)
-    if not os.path.exists(csv_path):
-        print(yellow(f"Warning: Beam table not found: {csv_path}"))
-        return None
-
-    elevations_deg = []
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            elevations_deg.append(float(row["Elevation"]))
-
-    # Sort top (most positive) to bottom (most negative) — this is row order in range image
-    elevations_deg.sort(reverse=True)
-    beam_elevations = np.radians(np.array(elevations_deg))
+    # Sort top (most positive) to bottom (most negative) — this is row order in range image.
+    sorted_deg = sorted(elevations_deg, reverse=True)
+    beam_elevations = np.radians(np.array(sorted_deg))
 
     _BEAM_TABLE_CACHE[sensor_type] = beam_elevations
     return beam_elevations
