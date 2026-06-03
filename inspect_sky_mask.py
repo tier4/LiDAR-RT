@@ -80,21 +80,40 @@ def compute_weak_col_frac(depth, weak_hit_rate=0.5, below_row_start=32):
     return float(weak_mask.mean()), weak_mask
 
 
-def render_frame(depth, vmax, weak_col_threshold=0.01, weak_hit_rate=0.5):
+def morphological_close(mask: np.ndarray, kernel: int) -> np.ndarray:
+    """max_pool2d(dilate) -> -max_pool2d(-) (erode), matches train.py exactly."""
+    if kernel <= 1:
+        return mask
+    m = torch.from_numpy(mask.astype(np.float32))[None, None]
+    pad = kernel // 2
+    dilated = torch.nn.functional.max_pool2d(m, kernel, stride=1, padding=pad)
+    closed = -torch.nn.functional.max_pool2d(-dilated, kernel, stride=1, padding=pad)
+    return (closed.squeeze().numpy() > 0.5)
+
+
+def render_frame(depth, vmax, weak_col_threshold=0.01, weak_hit_rate=0.5,
+                 sky_morph_kernel=0):
     """Stack the four panels for one frame."""
     H, W = depth.shape
     gt_mask = depth > 0
-    sky_mask = ~gt_mask
+    gt_mask_closed = morphological_close(gt_mask, sky_morph_kernel)
+    sky_mask = ~gt_mask_closed
     weak_frac, weak_mask = compute_weak_col_frac(depth, weak_hit_rate)
     is_dropped = weak_frac > weak_col_threshold
 
     panel_depth = colorize_depth(depth, vmax)
     panel_depth[~gt_mask] = 0  # mask depth==0 to black so structure is clearer
 
-    # sky_mask panel: WHITE = "no GT return" (LiDAR didn't come back),
-    # BLACK = pixel had a GT return.
+    # sky_mask panel: WHITE = "no GT return after morphological closing"
+    # (i.e. what train.py treats as sky for sky_loss), BLACK = either had
+    # a GT return or was an isolated dropout filled in by the closing.
     panel_sky = np.zeros((H, W, 3), dtype=np.uint8)
     panel_sky[sky_mask] = 255
+    # Highlight pixels that the closing filled in (had no return but are
+    # NOT in the sky mask because surrounded by returns) - tint blue.
+    filled_by_close = (~gt_mask) & gt_mask_closed
+    if filled_by_close.any():
+        panel_sky[filled_by_close] = (255, 128, 0)  # BGR cyan-ish
 
     # Drop indicator: tint columns flagged as weak with red, but ONLY at
     # pixels that actually had a hit. We must not paint over the white
@@ -145,6 +164,10 @@ def main():
     p.add_argument("--weak_hit_rate", type=float, default=0.5,
                    help="Per-column downward hit-rate threshold below which "
                         "a column is considered 'weak' (default: 0.5)")
+    p.add_argument("--sky_morph_kernel", type=int, default=5,
+                   help="Morphological-closing kernel to match train.py's "
+                        "sky_mask construction (default: 5, matches "
+                        "configs/t4/exp_t4.yaml). Use 0/1 to disable.")
     args = p.parse_args()
 
     cache = Path(args.cache_dir)
@@ -184,7 +207,8 @@ def main():
 
     # Render frames
     first = torch.load(pt_files[0], weights_only=True)["r1"][..., 0].numpy()
-    sample = render_frame(first, vmax, args.weak_col_threshold, args.weak_hit_rate)
+    sample = render_frame(first, vmax, args.weak_col_threshold, args.weak_hit_rate,
+                          sky_morph_kernel=args.sky_morph_kernel)
     H_out, W_out, _ = sample.shape
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -196,7 +220,8 @@ def main():
     print(f"\nWriting {len(pt_files)} frames to {args.output} ({W_out}x{H_out} @ {args.fps}fps) ...")
     for f in pt_files:
         d = torch.load(f, weights_only=True)["r1"][..., 0].numpy()
-        frame = render_frame(d, vmax, args.weak_col_threshold, args.weak_hit_rate)
+        frame = render_frame(d, vmax, args.weak_col_threshold, args.weak_hit_rate,
+                             sky_morph_kernel=args.sky_morph_kernel)
         # Stamp frame number
         idx = int(f.stem.split("_")[-1])
         cv2.putText(
