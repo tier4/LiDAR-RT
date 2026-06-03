@@ -354,11 +354,20 @@ class GaussianModel:
         return num
 
     def densify_and_prune(self, opt, min_opacity, max_screen_size,
-                          sensor_centers=None, min_range_prune=0.0):
+                          sensor_centers=None, min_range_prune=0.0,
+                          skip_densify=False):
+        # When skip_densify is True, we run only the pruning steps below
+        # (low-opacity, bbox-escape, min_range_prune, big-points). This lets
+        # us keep cleaning up after an asset has hit its point cap, instead
+        # of freezing both densification AND pruning the moment we cross it.
         mean_grads = (self.xyz_gradient_accum / self.denom).nan_to_num(0.0).squeeze(-1)
 
-        clone_num = self.densify_and_clone(mean_grads, opt.densify_grad_threshold)
-        split_num = self.densify_and_split(mean_grads, opt.densify_grad_threshold)
+        if skip_densify:
+            clone_num = 0
+            split_num = 0
+        else:
+            clone_num = self.densify_and_clone(mean_grads, opt.densify_grad_threshold)
+            split_num = self.densify_and_split(mean_grads, opt.densify_grad_threshold)
         print(f"clone_num: {clone_num}, split_num: {split_num}")
 
         low_opacity = (self.get_opacity < opt.thresh_opa_prune).squeeze()

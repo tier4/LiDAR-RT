@@ -317,11 +317,20 @@ class SceneLidar(Scene):
             )
             begin_index += points_num
 
-            # Densification
+            # Per-asset cap: each asset (bg, each object) is gated on its
+            # own point count, not the sum across assets. Previously bg and
+            # all object Gaussians shared one cap; once total crossed it,
+            # densify_and_prune stopped firing for bg too, which froze the
+            # min_range_prune / low-opacity / bbox-escape cleanup at the
+            # same time and left phantoms accumulated near the sensor.
+            #
+            # Pruning runs every densification step regardless of the cap
+            # (see skip_densify below); only clone/split is skipped when an
+            # asset is over its own cap.
             max_points = getattr(args.opt, "densify_until_num_points", -1)
-            total_points = sum(g.get_local_xyz.shape[0] for g in self.gaussians_assets)
-            points_under_cap = max_points < 0 or total_points < max_points
-            if iteration < args.opt.densify_until_iter and points_under_cap:
+            asset_points = gaussians.get_local_xyz.shape[0]
+            under_cap = max_points < 0 or asset_points < max_points
+            if iteration < args.opt.densify_until_iter:
                 gaussians.add_densification_stats(
                     instance_mean_grads, instance_accum_weights
                 )
@@ -346,6 +355,7 @@ class SceneLidar(Scene):
                         args.opt, 0.005, size_threshold,
                         sensor_centers=sensor_centers,
                         min_range_prune=getattr(args.opt, "min_range_prune", 0.0),
+                        skip_densify=not under_cap,
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
