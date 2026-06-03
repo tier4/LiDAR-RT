@@ -296,6 +296,8 @@ def training(args):
             for i in gaussians_assets:
                 points_num += i.get_local_xyz.shape[0]
             depth_mse = mse(depth[gt_mask], gt_depth[gt_mask]).mean().item()
+            depth_mae = torch.abs(depth[gt_mask] - gt_depth[gt_mask]).mean().item()
+            depth_rmse = depth_mse ** 0.5
             clone_sum = (
                 densify_info[0] + log["clone_sum"][-1]
                 if log["clone_sum"]
@@ -337,18 +339,59 @@ def training(args):
             recorder.update_loss_stats(reduced_losses)
 
             if WANDB_FOUND:
+                # Raydrop accuracy metrics
+                pred_drop = (render_pkg["raydrop"].reshape(-1) > 0.5)
+                gt_drop = labels_idx.reshape(-1)
+                rd_tp = (pred_drop & gt_drop).sum().item()
+                rd_fp = (pred_drop & ~gt_drop).sum().item()
+                rd_fn = (~pred_drop & gt_drop).sum().item()
+                rd_precision = rd_tp / max(rd_tp + rd_fp, 1)
+                rd_recall = rd_tp / max(rd_tp + rd_fn, 1)
+                rd_f1 = 2 * rd_precision * rd_recall / max(rd_precision + rd_recall, 1e-8)
+                rd_accuracy = (pred_drop == gt_drop).float().mean().item()
+
+                # Intensity loss components (unweighted)
+                int_l1 = l1_loss(intensity[gt_mask], gt_intensity[gt_mask]).item()
+                int_l2 = l2_loss(intensity[gt_mask], gt_intensity[gt_mask]).item()
+                int_ssim_val = ssim(
+                    (intensity * gt_mask).unsqueeze(0),
+                    (gt_intensity * gt_mask).unsqueeze(0),
+                ).item()
+
                 wandb.log(
                     {
+                        # Total losses
                         "train/loss": loss.item(),
-                        "train/depth_loss": loss_depth.item(),
-                        "train/intensity_loss": loss_intensity.item(),
-                        "train/raydrop_loss": loss_raydrop.item(),
-                        "train/cd_loss": loss_cd.item(),
-                        "train/reg_loss": loss_reg.item() if isinstance(loss_reg, torch.Tensor) else loss_reg,
-                        "train/depth_mse": depth_mse,
                         "train/ema_loss": (0.4 * loss + 0.6 * ema_loss_for_log).item(),
+                        # Depth
+                        "train/depth_loss": loss_depth.item(),
+                        "train/depth_mse": depth_mse,
+                        "train/depth_rmse": depth_rmse,
+                        "train/depth_mae": depth_mae,
+                        # Intensity (weighted total + unweighted components)
+                        "train/intensity_loss": loss_intensity.item(),
+                        "train/intensity_l1": int_l1,
+                        "train/intensity_l2": int_l2,
+                        "train/intensity_ssim": int_ssim_val,
+                        # Raydrop
+                        "train/raydrop_loss": loss_raydrop.item(),
+                        "train/raydrop_accuracy": rd_accuracy,
+                        "train/raydrop_precision": rd_precision,
+                        "train/raydrop_recall": rd_recall,
+                        "train/raydrop_f1": rd_f1,
+                        # Chamfer distance (unweighted + weighted)
+                        "train/chamfer_loss": chamfer_loss.item(),
+                        "train/cd_loss": loss_cd.item(),
+                        # Regularization
+                        "train/reg_loss": loss_reg.item() if isinstance(loss_reg, torch.Tensor) else loss_reg,
+                        # Densification
                         "train/points_num": points_num,
-                        "iteration": iteration,
+                        "train/clone_sum": clone_sum,
+                        "train/split_sum": split_sum,
+                        "train/prune_scale_sum": prune_scale_sum,
+                        "train/prune_opacity_sum": prune_opacity_sum,
+                        # Learning rate
+                        "train/lr_xyz": gaussians_assets[0].optimizer.param_groups[0]["lr"],
                     },
                     step=iteration,
                 )
@@ -419,6 +462,10 @@ def training(args):
                 if iteration >= args.saving_iterations[0] - 3000:
                     mix_metric = 0
                     eval_count = 0
+                    eval_depth_mae_sum = 0
+                    eval_depth_rmse_sum = 0
+                    eval_psnr_depth_sum = 0
+                    eval_psnr_intensity_sum = 0
                     for eval_sensor_name, eval_lidar in scene.train_lidars.items():
                         for frame in eval_lidar.eval_frames:
                             render_pkg = raytracing(
@@ -450,12 +497,25 @@ def training(args):
                                 .mean()
                                 .item()
                             )
+                            # Per-valid-pixel depth metrics
+                            valid = gt_mask & mask[..., 0]
+                            if valid.sum() > 0:
+                                eval_depth_mae_sum += torch.abs(depth[..., 0][valid] - gt_depth[valid]).mean().item()
+                                eval_depth_rmse_sum += (mse(depth[..., 0][valid], gt_depth[valid]).mean().item()) ** 0.5
+                            eval_psnr_depth_sum += psnr_depth
+                            eval_psnr_intensity_sum += psnr_intensity
                             mix_metric += psnr_depth + psnr_intensity
                             eval_count += 1
                     mix_metric /= max(eval_count, 1)
                     if WANDB_FOUND:
                         wandb.log(
-                            {"eval/mix_metric": mix_metric, "iteration": iteration},
+                            {
+                                "eval/mix_metric": mix_metric,
+                                "eval/depth_mae": eval_depth_mae_sum / max(eval_count, 1),
+                                "eval/depth_rmse": eval_depth_rmse_sum / max(eval_count, 1),
+                                "eval/psnr_depth": eval_psnr_depth_sum / max(eval_count, 1),
+                                "eval/psnr_intensity": eval_psnr_intensity_sum / max(eval_count, 1),
+                            },
                             step=iteration,
                         )
                     print(mix_metric, best_mix_metric)
