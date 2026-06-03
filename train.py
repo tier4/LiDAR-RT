@@ -128,7 +128,7 @@ def training(args):
         }
         wandb.init(
             entity="advanced-technology-department",
-            project="LiDAR-RT",
+            project="LiDAR-RT-debug",
             name=f"{args.exp_name}_scene{scene_id}",
             config=wandb_config,
         )
