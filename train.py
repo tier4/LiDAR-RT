@@ -693,6 +693,13 @@ if __name__ == "__main__":
         type=str,
         help="override source_dir from data config",
     )
+    parser.add_argument(
+        "-g",
+        "--gpu",
+        type=int,
+        default=None,
+        help="CUDA device ID to use (e.g. 0, 1). Defaults to current device.",
+    )
     launch_args = parser.parse_args()
 
     args = parse(launch_args.exp_config_path)
@@ -701,6 +708,16 @@ if __name__ == "__main__":
     args.only_refine = launch_args.only_refine
     if launch_args.source_dir:
         args.source_dir = launch_args.source_dir
+
+    if launch_args.gpu is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available; cannot select device.")
+        if launch_args.gpu < 0 or launch_args.gpu >= torch.cuda.device_count():
+            raise ValueError(
+                f"Invalid --gpu {launch_args.gpu}: only {torch.cuda.device_count()} CUDA device(s) visible."
+            )
+        torch.cuda.set_device(launch_args.gpu)
+        print(blue(f"Using CUDA device {launch_args.gpu}: {torch.cuda.get_device_name(launch_args.gpu)}"))
 
     if not os.path.exists(args.model_dir):
         os.makedirs(args.model_dir)
