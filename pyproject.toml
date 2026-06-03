@@ -5,7 +5,7 @@ description = "LiDAR-RT: Gaussian-based Ray Tracing for Dynamic LiDAR Re-simulat
 authors = [{ name = "cxzhou35", email = "cxzhou35@zju.edu.cn" }]
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10.0"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.3.0,<2.4.0",
     "torchvision>=0.18.0,<0.19.0",
