@@ -40,6 +40,13 @@ def build_args():
         "-t", "--type", type=str, default="all", help="train/test/all"
     )
     parser.add_argument("--save", type=str, default="", help="Save .rrd file path")
+    parser.add_argument(
+        "-s",
+        "--source_dir",
+        type=str,
+        default="",
+        help="override source_dir from data config",
+    )
     launch = parser.parse_args()
 
     args = parse(launch.exp_config_path)
@@ -48,6 +55,8 @@ def build_args():
     args.unet = launch.unet
     args.eval_type = launch.type
     args.rerun_save = launch.save
+    if launch.source_dir:
+        args.source_dir = launch.source_dir
     return args
 
 
