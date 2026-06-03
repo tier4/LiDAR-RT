@@ -26,7 +26,7 @@ from lib.scene.unet import UNet
 from lib.utils.image_utils import color_mapping
 from tqdm import tqdm
 
-RAYDROP_RATIO = 0.6
+RAYDROP_RATIO = 0.5
 COLORMAP = 20  # JET
 
 
@@ -330,7 +330,7 @@ def main():
             rd_all_pts = lidar.range2point(frame_id, rendered_depth_np).cpu().numpy().astype(np.float64)
 
             gt_mask_2d = gt_rayhit_np.squeeze(-1).astype(bool)
-            rd_mask_2d = mask.squeeze(-1).astype(bool)
+            rd_mask_2d = (mask & (rendered_depth_np > 0)).squeeze(-1).astype(bool)
 
             gt_pts = gt_all_pts[gt_mask_2d] - origin_offset
             rendered_pts = rd_all_pts[rd_mask_2d] - origin_offset
