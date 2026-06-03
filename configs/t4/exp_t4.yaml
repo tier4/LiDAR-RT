@@ -41,7 +41,7 @@ opt:
   lambda_intensity_dssim: 0.15
   lambda_raydrop_bce: 0.01
   lambda_reg: 0.1
-  lambda_sky: 0.1
+  lambda_sky: 0.05
   lambda_near: 0.1
   min_range_prune: 1.0   # Hard-prune background Gaussians within this distance from any sensor
   min_range_push: 3.0    # Soft hinge loss pushes rendered depth above this distance

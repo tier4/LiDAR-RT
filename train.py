@@ -271,6 +271,12 @@ def training(args):
         # — surrounded by hits) are treated as hits. Without this the sky
         # loss would also suppress Gaussians at those genuine-drop pixels and
         # rob the SH / intensity supervision of any learning signal there.
+        #
+        # We average over phantom pixels only (sky ∩ depth>0), NOT over the
+        # full sky mask. Averaging over the full sky dilutes the per-phantom
+        # gradient by N_sky / N_phantom (often 20x+), so each phantom Gaussian
+        # receives much weaker pressure than the nominal lambda suggests. The
+        # per-phantom mean keeps the gradient magnitude scene-invariant.
         lambda_sky = getattr(args.opt, "lambda_sky", 0.0)
         sky_kernel = int(getattr(args.opt, "sky_morph_kernel", 3))
         if lambda_sky > 0:
@@ -285,8 +291,9 @@ def training(args):
                 sky_mask = ~gt_mask_closed
             else:
                 sky_mask = ~gt_mask
-            if sky_mask.any():
-                loss_sky = lambda_sky * depth[sky_mask].abs().mean()
+            phantom_in_sky = sky_mask & (depth > 0)
+            if phantom_in_sky.any():
+                loss_sky = lambda_sky * depth[phantom_in_sky].mean()
             else:
                 loss_sky = torch.tensor(0.0, device="cuda")
         else:
