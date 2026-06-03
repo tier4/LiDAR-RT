@@ -440,16 +440,20 @@ def training(args):
             recorder.record("train")
 
             if iteration % args.visual_interval == 0:
+                # Pick a non-dropped frame for visualization. train_lidar.train_frames
+                # has already been filtered by skip_dropped_frames in the loader.
+                viz_frames = scene.train_lidar.train_frames or [frame_s]
+                viz_frame = viz_frames[0]
                 render_pkg = raytracing(
-                    frame_s, gaussians_assets, scene.train_lidar, background, args  # first sensor for viz
+                    viz_frame, gaussians_assets, scene.train_lidar, background, args  # first sensor for viz
                 )
                 rendered_depth = render_pkg["depth"]
                 rendered_intensity = render_pkg["intensity"]
                 rendered_raydrop = render_pkg["raydrop"]
 
                 # GT for side-by-side comparison
-                gt_depth_viz = scene.train_lidar.get_depth(frame_s).cuda()
-                gt_mask_viz = scene.train_lidar.get_mask(frame_s).cuda()
+                gt_depth_viz = scene.train_lidar.get_depth(viz_frame).cuda()
+                gt_mask_viz = scene.train_lidar.get_mask(viz_frame).cuda()
 
                 # Use 0..max(GT, rendered) so near-range phantom Gaussians (depth
                 # below GT's minimum) are still visible in the colormap rather
@@ -474,18 +478,24 @@ def training(args):
 
                 gt_depth_img = colorize_depth(gt_depth_np, dmin, dmax, mask=gt_mask_np)
                 pred_depth_img = colorize_depth(rendered_depth_2d, dmin, dmax, mask=pred_hit_any)
-                # Sky-violation: GT says no return but a Gaussian intercepted
-                # the ray (depth>0). Directly shows phantom Gaussian artifacts.
-                sky_violation_mask = pred_hit_any & (~gt_mask_np)
-                sky_violation_img = colorize_depth(
-                    rendered_depth_2d, dmin, dmax, mask=sky_violation_mask
-                )
 
-                rendered_intensity_np = rendered_intensity.clamp(0, 1).detach().cpu().numpy()
-                rendered_intensity_vis = colorize_intensity(rendered_intensity_np)
+                # Per-pixel |gt - pred| at pixels where both are valid.
+                err_valid = gt_mask_np & pred_hit_any
+                err_map = np.zeros_like(gt_depth_np, dtype=np.float32)
+                err_map[err_valid] = np.abs(
+                    gt_depth_np[err_valid] - rendered_depth_2d[err_valid]
+                )
+                # Cap colormap at the 99th percentile of valid errors so a few
+                # huge outliers (e.g., a phantom Gaussian) don't wash out the rest.
+                if err_valid.any():
+                    err_cap = float(np.quantile(err_map[err_valid], 0.99))
+                else:
+                    err_cap = 1.0
+                err_cap = max(err_cap, 1e-3)
+                error_img = colorize_depth(err_map, 0.0, err_cap, mask=err_valid)
 
                 concat_image = np.concatenate(
-                    [gt_depth_img, pred_depth_img, sky_violation_img, rendered_intensity_vis], axis=0
+                    [gt_depth_img, pred_depth_img, error_img], axis=0
                 )
                 rgb_image = concat_image
                 os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
@@ -501,9 +511,8 @@ def training(args):
                         "viz/depth_compare": wandb.Image(
                             cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB),
                             caption=(
-                                f"iter {iteration} | top→bot: "
-                                "gt_depth (gt_mask) / pred_depth (any hit) / "
-                                "sky_violation (pred hit on sky pixel) / pred_intensity"
+                                f"iter {iteration} | frame {viz_frame} | top→bot: "
+                                f"depth_gt / depth_rendered / error (cap={err_cap:.2f}m)"
                             ),
                         ),
                     }, step=iteration)

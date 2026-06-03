@@ -89,11 +89,35 @@ def load_scene_fast(args):
 
     # Setup frame lists on all sensors
     frame_range = args.frame_length
-    eval_frames = args.eval_frames
+    eval_frames = list(args.eval_frames)
     train_frames = [
         fid for fid in range(frame_range[0], frame_range[1] + 1)
         if fid not in eval_frames
     ]
+
+    # Mirror the loader's drop filter so visualization skips broken frames too
+    skip_drops = getattr(args, "skip_dropped_frames", False)
+    weak_col_thr = float(getattr(args, "dropped_frame_threshold", 0.01))
+    weak_hit_rate = float(getattr(args, "dropped_frame_hit_rate", 0.5))
+    if skip_drops:
+        dropped = set()
+        for sensor_name, lidar in lidars.items():
+            bad = lidar.detect_dropped_frames(
+                weak_col_threshold=weak_col_thr,
+                weak_hit_rate=weak_hit_rate,
+            )
+            if bad:
+                print(f"[{sensor_name}] {len(bad)} dropped frame(s) "
+                      f"(weak_col > {weak_col_thr:.0%}): "
+                      + ", ".join(f"{fid}({frac*100:.1f}%)" for fid, frac in bad))
+                dropped.update(fid for fid, _ in bad)
+        if dropped:
+            before_t, before_e = len(train_frames), len(eval_frames)
+            train_frames = [f for f in train_frames if f not in dropped]
+            eval_frames = [f for f in eval_frames if f not in dropped]
+            print(f"[skip_dropped_frames] train: {before_t} -> {len(train_frames)}, "
+                  f"eval: {before_e} -> {len(eval_frames)}")
+
     for sensor_name, lidar in lidars.items():
         lidar.set_frames(train_frames, eval_frames)
 
@@ -196,14 +220,17 @@ def main():
     background = torch.tensor([0, 0, 1], device="cuda").float()
 
     # --- Determine frames ---
-    eval_frames = args.eval_frames
+    # Use the per-sensor frame lists set up by load_lidar_data(), which have
+    # already been filtered for dropped frames if skip_dropped_frames=True.
+    first_lidar_obj = next(iter(lidars.values()))
+    train_frames = list(first_lidar_obj.train_frames)
+    eval_frames = list(first_lidar_obj.eval_frames)
     if args.eval_type == "train":
-        all_frames = [f for f in range(args.frame_length[0], args.frame_length[1] + 1)
-                      if f not in eval_frames]
+        all_frames = train_frames
     elif args.eval_type == "test":
         all_frames = eval_frames
     else:
-        all_frames = list(range(args.frame_length[0], args.frame_length[1] + 1))
+        all_frames = sorted(set(train_frames) | set(eval_frames))
 
     print(f"Rendering {len(all_frames)} frames x {len(sensor_names)} sensor(s)...", flush=True)
 

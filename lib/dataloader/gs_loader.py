@@ -42,6 +42,34 @@ class SceneLidar(Scene):
             if frame_id not in eval_frames
         ]
 
+        # Skip frames whose range images have missing azimuth bands (rosbag
+        # packet drops, off-by-one chunk reads, etc). Detection is per-sensor:
+        # a frame is dropped if ANY sensor flagged it. Opt-in via config
+        # (skip_dropped_frames, default off for non-T4 datasets).
+        skip_drops = getattr(args, "skip_dropped_frames", False)
+        weak_col_thr = float(getattr(args, "dropped_frame_threshold", 0.01))
+        weak_hit_rate = float(getattr(args, "dropped_frame_hit_rate", 0.5))
+        if skip_drops:
+            dropped = set()
+            for sensor_name, lidar in lidars_dict.items():
+                bad = lidar.detect_dropped_frames(
+                    weak_col_threshold=weak_col_thr,
+                    weak_hit_rate=weak_hit_rate,
+                )
+                if bad:
+                    print(f"[{sensor_name}] detected {len(bad)} dropped frame(s) "
+                          f"(weak_col > {weak_col_thr:.0%}, "
+                          f"col hit rate < {weak_hit_rate:.0%}):")
+                    for fid, frac in bad:
+                        print(f"    frame {fid:>3}: weak_col={frac*100:.1f}%")
+                    dropped.update(fid for fid, _ in bad)
+            if dropped:
+                before_train, before_eval = len(train_frames), len(eval_frames)
+                train_frames = [f for f in train_frames if f not in dropped]
+                eval_frames = [f for f in eval_frames if f not in dropped]
+                print(f"[skip_dropped_frames] train: {before_train} -> {len(train_frames)}, "
+                      f"eval: {before_eval} -> {len(eval_frames)}")
+
         self.train_lidars = lidars_dict
         for sensor_name, lidar in self.train_lidars.items():
             lidar.set_frames(train_frames, eval_frames)

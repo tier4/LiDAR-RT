@@ -1,5 +1,12 @@
 data_type: "T4"
 
+# Skip frames whose range image is missing whole azimuth bands (rosbag packet
+# drops). The threshold is the fraction of columns where every downward beam
+# has zero return; >1% reliably distinguishes packet-drop frames from healthy
+# ones for the Hesai OT128 used here.
+skip_dropped_frames: True
+dropped_frame_threshold: 0.01
+
 # Single TOP LiDAR configuration (Waymo-style baseline).
 # Multi-LiDAR setup is preserved in git history (revert this file to restore).
 lidar_sensors:

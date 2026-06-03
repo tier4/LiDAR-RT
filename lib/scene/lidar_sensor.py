@@ -92,6 +92,35 @@ class LiDARSensor:
             len(self.train_frames) + len(self.eval_frames) <= self.num_frames
         ), "Found illegal frame ranges!"
 
+    def detect_dropped_frames(self, weak_col_threshold=0.01,
+                              weak_hit_rate=0.5, below_row_start=32):
+        """Return frame ids whose range image has missing/partial azimuth bands.
+
+        Heuristic: for each azimuth column, compute the hit rate among
+        downward beams (rows >= below_row_start). In a healthy outdoor sweep
+        every downward beam at every azimuth should hit the ground or some
+        nearby object, so the per-column hit rate is normally ~95–100%.
+        A column whose hit rate drops below `weak_hit_rate` (default 50%) is
+        flagged as "weak"; if the fraction of weak columns exceeds
+        `weak_col_threshold` we treat the whole frame as a rosbag packet drop.
+
+        Returns: list of (frame_id, weak_col_fraction) tuples.
+        """
+        bad = []
+        for frame in sorted(self.range_image_return1.keys()):
+            depth = self.range_image_return1[frame][..., 0]  # (H, W)
+            H, W = depth.shape
+            row_start = min(below_row_start, max(H - 1, 0))
+            below = depth[row_start:]
+            if below.numel() == 0:
+                continue
+            col_hit_rate = (below > 0).float().mean(dim=0)  # (W,)
+            weak_cols = (col_hit_rate < weak_hit_rate).sum().item()
+            weak_frac = weak_cols / W
+            if weak_frac > weak_col_threshold:
+                bad.append((frame, weak_frac))
+        return bad
+
     def add_frame(self, frame, ego2world, r1, r2, pixel_pose=None):
         if isinstance(ego2world, np.ndarray):
             ego2world = torch.from_numpy(ego2world)
