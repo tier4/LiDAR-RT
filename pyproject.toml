@@ -40,7 +40,7 @@ classifiers = [
 find-links = ["https://download.pytorch.org/whl/cu121"]
 
 [tool.uv.sources]
-t4-devkit = { git = "https://github.com/tier4/t4-devkit.git", rev = "a17e67e2765167aa4c3c212a629f3c42f26ebffa" }
+t4-devkit = { git = "https://github.com/tier4/t4-devkit.git", rev = "4da7fd576a53165b3ce7090c45af4ce85eaaf80c" }
 
 [project.urls]
 homepage = "https://zju3dv.github.io/lidar-rt"
