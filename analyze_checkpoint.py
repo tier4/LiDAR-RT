@@ -69,12 +69,19 @@ def main():
           f"max={opa.max():.4f}  mean={opa.mean():.4f}")
 
     # Distance from each Gaussian to the NEAREST sensor across all frames
-    # (chunked to avoid OOM on 1.5M+ Gaussians x N frames)
+    # (chunked to avoid OOM on 1.5M+ Gaussians x N frames).
+    # Sensor centers are in UTM-like world coords (~1e5), so we shift to the
+    # sensor centroid before cdist to avoid catastrophic-cancellation noise
+    # in the |a|^2 + |b|^2 - 2*a*b expansion. See note in
+    # gaussian_model.densify_and_prune for the full explanation.
+    origin = centers_t.mean(dim=0, keepdim=True)
+    xyz_shift = (xyz - origin).float()
+    cents_shift = (centers_t - origin).float()
     dist_min = torch.empty(xyz.shape[0], device="cuda")
     chunk = 65536
     for s in range(0, xyz.shape[0], chunk):
         e = min(s + chunk, xyz.shape[0])
-        d = torch.cdist(xyz[s:e], centers_t)
+        d = torch.cdist(xyz_shift[s:e], cents_shift)
         dist_min[s:e] = d.min(dim=1).values
 
     # Histogram by distance bands
@@ -179,7 +186,7 @@ def main():
     dist_idx = torch.empty(xyz.shape[0], dtype=torch.long, device="cuda")
     for s in range(0, xyz.shape[0], chunk):
         e = min(s + chunk, xyz.shape[0])
-        d = torch.cdist(xyz[s:e], centers_t)
+        d = torch.cdist(xyz_shift[s:e], cents_shift)
         dist_idx[s:e] = d.argmin(dim=1)
     nearest = centers_t[dist_idx]
     horiz = torch.norm(xyz[:, :2] - nearest[:, :2], dim=1)

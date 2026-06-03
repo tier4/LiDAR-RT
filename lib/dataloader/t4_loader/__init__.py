@@ -439,6 +439,16 @@ def _load_t4_multi_lidar(base_dir, args, lidar_sensors_cfg):
         frame_timestamps[frame] = sd.timestamp
         frame_ego2world[frame] = _get_ego2world(t4, sd.ego_pose_token)
 
+    # Shift the world origin to the first frame's ego position. T4 ego poses
+    # are in a UTM-like global frame (~1e5 m), so any |a|^2 + |b|^2 - 2*a*b
+    # distance computation (e.g. torch.cdist for min_range_prune) loses ~100 m
+    # of precision in float32. Re-centering keeps all downstream coordinates
+    # in the ~1e3 m range and is sensor-agnostic (matches multi-sensor use).
+    world_origin = frame_ego2world[frames[0]][:3, 3].copy()
+    for frame in frame_ego2world:
+        frame_ego2world[frame][:3, 3] -= world_origin
+    print(f"  ego-init frame: shifted world by {world_origin.tolist()} (now {frame_ego2world[frames[0]][:3, 3].tolist()})")
+
     # Open rosbag reader with all sensor topics
     bag_dir = os.path.join(base_dir, "input_bag")
     _ensure_bag_storage_identifier(bag_dir)
@@ -555,7 +565,7 @@ def _load_t4_multi_lidar(base_dir, args, lidar_sensors_cfg):
     reader.close()
 
     # Load bounding boxes (shared across all sensors)
-    bboxes = _load_t4_bboxes(t4, lidar_sample_datas, frames, args)
+    bboxes = _load_t4_bboxes(t4, lidar_sample_datas, frames, args, world_origin)
 
     return lidars, bboxes
 
@@ -596,9 +606,15 @@ def _load_t4_single_lidar(base_dir, args):
     cache_dir = os.path.join(base_dir, "cache", lidar_channel)
     os.makedirs(cache_dir, exist_ok=True)
 
+    # Compute world_origin from the first frame's ego pose so all coordinates
+    # are recentered to the ego-init frame. See multi-lidar path for rationale.
+    world_origin = _get_ego2world(t4, lidar_sample_datas[frames[0]].ego_pose_token)[:3, 3].copy()
+    print(f"  ego-init frame: shifted world by {world_origin.tolist()}")
+
     for frame in tqdm(range(frames[0], frames[1] + 1)):
         sd = lidar_sample_datas[frame]
         ego2world = _get_ego2world(t4, sd.ego_pose_token)
+        ego2world[:3, 3] -= world_origin
 
         cache_path = os.path.join(cache_dir, f"range_image_frame_{frame}.pt")
         if os.path.exists(cache_path):
@@ -623,12 +639,16 @@ def _load_t4_single_lidar(base_dir, args):
 
         lidar.add_frame(frame, ego2world, range_image_r1, range_image_r2)
 
-    bboxes = _load_t4_bboxes(t4, lidar_sample_datas, frames, args)
+    bboxes = _load_t4_bboxes(t4, lidar_sample_datas, frames, args, world_origin)
     return lidar, bboxes
 
 
-def _load_t4_bboxes(t4, lidar_sample_datas, frames, args):
-    """Load 3D bounding boxes from T4 annotations."""
+def _load_t4_bboxes(t4, lidar_sample_datas, frames, args, world_origin=None):
+    """Load 3D bounding boxes from T4 annotations.
+
+    If world_origin is supplied (the first frame's ego-pose translation), all
+    box positions are recentered to the ego-init frame so the bbox poses match
+    the shifted ego2world / sensor_center coordinates."""
     bboxes = {}
     vehicle_categories = {"car", "truck", "bus", "bicycle", "motorcycle", "trailer"}
 
@@ -649,6 +669,8 @@ def _load_t4_bboxes(t4, lidar_sample_datas, frames, args):
                 bboxes[object_id] = BoundingBox(1, object_id, torch.tensor(size).float())
 
             position = np.array(box.position)
+            if world_origin is not None:
+                position = position - world_origin
             rotation_matrix = box.rotation.rotation_matrix
 
             pos_t = torch.from_numpy(position).float().cuda()

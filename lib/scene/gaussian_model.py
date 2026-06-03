@@ -390,9 +390,24 @@ class GaussianModel:
         # Below the LiDAR's minimum measurable range no real returns exist, so
         # these are necessarily phantom Gaussians (object Gaussians are handled
         # via the bbox check above and skipped here).
+        #
+        # torch.cdist uses the expansion |a|^2 + |b|^2 - 2*a*b, which suffers
+        # catastrophic cancellation when both vectors live near a far-from-origin
+        # frame (UTM coords are ~1e5, |a|^2 ~ 1e10, so float32's ~7-digit
+        # precision leaves ~hundred-meter noise on the squared distance). The
+        # noise made every close-range Gaussian look like it lived inside the
+        # min_range_prune sphere of some sensor — exactly the "donut hole"
+        # around the trajectory we were seeing. Shift the origin to the sensor
+        # centroid before cdist; differences stay in the < ~10^3 m range and
+        # the cancellation goes away.
         if (self.bounding_box is None and sensor_centers is not None
                 and min_range_prune > 0 and self.get_local_xyz.shape[0] > 0):
-            dists = torch.cdist(self.get_local_xyz, sensor_centers.to(self.get_local_xyz.device))
+            sc = sensor_centers.to(self.get_local_xyz.device)
+            origin = sc.mean(dim=0, keepdim=True)
+            dists = torch.cdist(
+                (self.get_local_xyz - origin).float(),
+                (sc - origin).float(),
+            )
             min_dist = dists.min(dim=1).values
             too_close = min_dist < min_range_prune
             prune_mask = torch.logical_or(prune_mask, too_close)
