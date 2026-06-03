@@ -351,6 +351,45 @@ def load_t4_raw(base_dir, args):
         return {sensor_name: lidar}, bboxes
 
 
+def _ensure_bag_storage_identifier(bag_dir):
+    """Patch metadata.yaml when storage_identifier is empty.
+
+    Some T4 datasets exported via webauto leave `storage_identifier` blank,
+    which makes rosbags refuse to open them. We detect the format from the
+    payload file extension (.mcap / .db3) and rewrite the field in place.
+    """
+    metadata_path = os.path.join(bag_dir, "metadata.yaml")
+    if not os.path.isfile(metadata_path):
+        return
+
+    with open(metadata_path, "r") as f:
+        text = f.read()
+
+    import re
+    match = re.search(r"^(\s*storage_identifier\s*:\s*)(.*)$", text, re.MULTILINE)
+    if not match:
+        return
+    current = match.group(2).strip().strip('"').strip("'")
+    if current:
+        return
+
+    has_mcap = any(fn.endswith(".mcap") for fn in os.listdir(bag_dir))
+    has_db3 = any(fn.endswith(".db3") for fn in os.listdir(bag_dir))
+    if has_mcap and not has_db3:
+        inferred = "mcap"
+    elif has_db3 and not has_mcap:
+        inferred = "sqlite3"
+    else:
+        return
+
+    new_text = text[:match.start(2)] + f'"{inferred}"' + text[match.end(2):]
+    with open(metadata_path, "w") as f:
+        f.write(new_text)
+    print(yellow(
+        f"Patched empty storage_identifier in {metadata_path} -> {inferred!r}"
+    ))
+
+
 def _load_t4_multi_lidar(base_dir, args, lidar_sensors_cfg):
     """Load multiple LiDAR sensors from rosbag.
 
@@ -385,6 +424,7 @@ def _load_t4_multi_lidar(base_dir, args, lidar_sensors_cfg):
 
     # Open rosbag reader with all sensor topics
     bag_dir = os.path.join(base_dir, "input_bag")
+    _ensure_bag_storage_identifier(bag_dir)
     topic_mappings = [
         TopicMapping(
             channel=s["name"],
