@@ -1,8 +1,7 @@
 data_type: "T4"
 
-# Multi-LiDAR configuration
-# Each sensor is loaded individually from rosbag via t4-devkit.
-# sensor2ego transforms are automatically read from /tf_static in the rosbag.
+# Single TOP LiDAR configuration (Waymo-style baseline).
+# Multi-LiDAR setup is preserved in git history (revert this file to restore).
 lidar_sensors:
   - name: hesai_top
     topic: "/sensing/lidar/top/pandar_packets"
@@ -13,55 +12,5 @@ lidar_sensors:
     inc_bottom: -25.0
     inc_top: 15.0
     max_depth: 200.0
-
-  - name: hesai_front_left
-    topic: "/sensing/lidar/front_left/pandar_packets"
-    sensor_type: "XT32"
-    frame_id: "hesai_front_left"
-    range_image_height: 32
-    range_image_width: 1800
-    inc_bottom: -16.0
-    inc_top: 15.0
-    max_depth: 120.0
-
-  - name: hesai_front_right
-    topic: "/sensing/lidar/front_right/pandar_packets"
-    sensor_type: "XT32"
-    frame_id: "hesai_front_right"
-    range_image_height: 32
-    range_image_width: 1800
-    inc_bottom: -16.0
-    inc_top: 15.0
-    max_depth: 120.0
-
-  - name: hesai_side_left
-    topic: "/sensing/lidar/side_left/pandar_packets"
-    sensor_type: "XT32"
-    frame_id: "hesai_side_left"
-    range_image_height: 32
-    range_image_width: 1800
-    inc_bottom: -16.0
-    inc_top: 15.0
-    max_depth: 120.0
-
-  - name: hesai_side_right
-    topic: "/sensing/lidar/side_right/pandar_packets"
-    sensor_type: "XT32"
-    frame_id: "hesai_side_right"
-    range_image_height: 32
-    range_image_width: 1800
-    inc_bottom: -16.0
-    inc_top: 15.0
-    max_depth: 120.0
-
-  - name: hesai_rear
-    topic: "/sensing/lidar/rear/pandar_packets"
-    sensor_type: "XT32"
-    frame_id: "hesai_rear"
-    range_image_height: 32
-    range_image_width: 1800
-    inc_bottom: -16.0
-    inc_top: 15.0
-    max_depth: 120.0
 
 max_depth: 200.0
