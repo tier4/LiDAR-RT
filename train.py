@@ -122,6 +122,7 @@ def training(args):
             "lambda_cd": getattr(args.opt, "lambda_cd", None),
             "lambda_reg": getattr(args.opt, "lambda_reg", None),
             "lambda_sky": getattr(args.opt, "lambda_sky", None),
+            "lambda_freespace": getattr(args.opt, "lambda_freespace", None),
             "min_range_prune": getattr(args.opt, "min_range_prune", None),
             "max_depth": getattr(args, "max_depth", None),
             "densify_until_iter": getattr(args.opt, "densify_until_iter", None),
@@ -200,6 +201,7 @@ def training(args):
         depth = render_pkg["depth"]
         intensity = render_pkg["intensity"]
         raydrop_prob = render_pkg["raydrop"]
+        accum = render_pkg["accum"]
         means3d = render_pkg["means3D"]
         acc_wet = render_pkg["accum_gaussian_weight"]
 
@@ -295,9 +297,29 @@ def training(args):
             else:
                 loss_sky = torch.tensor(0.0, device="cuda")
         else:
+            sky_mask = ~gt_mask
             loss_sky = torch.tensor(0.0, device="cuda")
 
-        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky
+        # === free-space loss ===
+        # Pushes the accumulated alpha W = sum_i alpha_i * T_i toward 0 on
+        # rays that did not return (sky / dropout). Operates directly on the
+        # opacity channel via the tracer's ACCUM output, so the per-Gaussian
+        # gradient is +λ * T_i / (1-α_i) — always positive regardless of
+        # what lies behind, unlike sky_loss whose sign can flip when there
+        # is a background hit on the same ray and which actively *grows*
+        # foreground phantoms in that case. Averaged over the phantom set
+        # only to keep magnitude scene-invariant.
+        lambda_fs = getattr(args.opt, "lambda_freespace", 0.0)
+        if lambda_fs > 0:
+            phantom_in_sky_fs = sky_mask & (accum.squeeze(-1) > 0)
+            if phantom_in_sky_fs.any():
+                loss_freespace = lambda_fs * accum.squeeze(-1)[phantom_in_sky_fs].mean()
+            else:
+                loss_freespace = torch.tensor(0.0, device="cuda")
+        else:
+            loss_freespace = torch.tensor(0.0, device="cuda")
+
+        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace
 
         # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
         if not torch.isfinite(loss):
@@ -427,6 +449,8 @@ def training(args):
                         "train/reg_loss": loss_reg.item() if isinstance(loss_reg, torch.Tensor) else loss_reg,
                         # Sky transparency
                         "train/sky_loss": loss_sky.item(),
+                        # Free-space supervision
+                        "train/freespace_loss": loss_freespace.item(),
                         # Densification
                         "train/points_num": points_num,
                         "train/clone_sum": clone_sum,

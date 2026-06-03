@@ -164,6 +164,12 @@ def raytracing(
     rayhit_logits = rendered_tensor[:, :, 1:2]
     raydrop_logits = rendered_tensor[:, :, 2:3]
     depth = rendered_tensor[:, :, 3:4]
+    # Accumulated alpha along the ray (W = sum_i alpha_i * T_i = 1 - T_final).
+    # Used by the free-space loss in train.py to push opacity to zero on
+    # rays the LiDAR did not return on — a direct opacity-side gradient, in
+    # contrast to depth's t-weighted gradient which biases against close
+    # phantoms and can even flip sign in the presence of background hits.
+    accum = rendered_tensor[:, :, 4:5]
 
     if args.opt.use_rayhit:
         logits = torch.cat([rayhit_logits, raydrop_logits], dim=-1)
@@ -176,6 +182,7 @@ def raytracing(
         "depth": depth,
         "intensity": intensities,
         "raydrop": raydrop_prob,
+        "accum": accum,
         "means3D": means3D,
         "accum_gaussian_weight": accum_gaussian_weights.unsqueeze(-1),
     }

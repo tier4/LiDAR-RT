@@ -491,6 +491,7 @@ extern "C" __global__ void __raygen__ot()
 	);
 	
 	const float final_T = params.out_attr_float32[NUM_CHANNELS_F * tidx + FINALT_OFFSET];
+	const float final_W = params.out_attr_float32[NUM_CHANNELS_F * tidx + ACCUM_OFFSET];
 
 	// Prepare gradients computation data
     glm::vec3 C = {0.0f, 0.0f, 0.0f};
@@ -597,8 +598,14 @@ extern "C" __global__ void __raygen__ot()
 				dL_dbg += dL_drgb[ch] * params.background[ch];
 			dL_dalpha += dL_dbg * (-final_T * inv_1_alpha);
 
-			float dL_ddpt_gs = dL_ddpt * w; 
+			float dL_ddpt_gs = dL_ddpt * w;
 			dL_dalpha += dL_ddpt * (T * dpt - (final_depth - D) * inv_1_alpha);
+
+			// Free-space supervision: propagate gradient from accumulated
+			// weight W = sum(alpha_i * T_i). For Gaussian i the chain rule
+			// gives ∂W_total/∂α_i = T_i - (W_total - W_so_far)/(1-α_i), the
+			// same pattern as depth with attribute = 1 instead of dpt.
+			dL_dalpha += dL_dacc * (T - (final_W - W) * inv_1_alpha);
 
 			float3 dL_dnormal_gs = dL_dnorm * w;
 			dL_dalpha += sumf3(dL_dnorm * (T * normal - (final_normal - N) * inv_1_alpha));

@@ -42,6 +42,7 @@ opt:
   lambda_raydrop_bce: 0.01
   lambda_reg: 0.1
   lambda_sky: 0.02
+  lambda_freespace: 0.05  # Push accumulated alpha to 0 on sky rays (direct opacity gradient)
   min_range_prune: 1.0   # Hard-prune background Gaussians within this distance from any sensor
   sky_morph_kernel: 5    # Morphological closing kernel applied to gt_mask before sky loss
                          #   (0/1 = disabled, 3 fills 1-pix holes, 5 fills 2-pix holes)
