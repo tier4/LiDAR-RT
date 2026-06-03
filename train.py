@@ -122,9 +122,7 @@ def training(args):
             "lambda_cd": getattr(args.opt, "lambda_cd", None),
             "lambda_reg": getattr(args.opt, "lambda_reg", None),
             "lambda_sky": getattr(args.opt, "lambda_sky", None),
-            "lambda_near": getattr(args.opt, "lambda_near", None),
             "min_range_prune": getattr(args.opt, "min_range_prune", None),
-            "min_range_push": getattr(args.opt, "min_range_push", None),
             "max_depth": getattr(args, "max_depth", None),
             "densify_until_iter": getattr(args.opt, "densify_until_iter", None),
             "densify_from_iter": getattr(args.opt, "densify_from_iter", None),
@@ -299,23 +297,7 @@ def training(args):
         else:
             loss_sky = torch.tensor(0.0, device="cuda")
 
-        # === near-range push loss ===
-        # Soft hinge: penalize any rendered depth below the LiDAR's effective
-        # minimum range, pushing Gaussians away from the sensor's blind zone.
-        # depth=0 (no Gaussian hit) is ignored.
-        lambda_near = getattr(args.opt, "lambda_near", 0.0)
-        min_range_push = getattr(args.opt, "min_range_push", 0.0)
-        if lambda_near > 0 and min_range_push > 0:
-            valid = depth > 0
-            if valid.any():
-                violation = torch.clamp(min_range_push - depth, min=0.0)
-                loss_near = lambda_near * violation[valid].mean()
-            else:
-                loss_near = torch.tensor(0.0, device="cuda")
-        else:
-            loss_near = torch.tensor(0.0, device="cuda")
-
-        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_near
+        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky
 
         # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
         if not torch.isfinite(loss):
@@ -445,8 +427,6 @@ def training(args):
                         "train/reg_loss": loss_reg.item() if isinstance(loss_reg, torch.Tensor) else loss_reg,
                         # Sky transparency
                         "train/sky_loss": loss_sky.item(),
-                        # Near-range push
-                        "train/near_loss": loss_near.item(),
                         # Densification
                         "train/points_num": points_num,
                         "train/clone_sum": clone_sum,

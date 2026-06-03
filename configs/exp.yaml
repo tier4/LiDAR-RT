@@ -42,9 +42,7 @@ opt:
   lambda_raydrop_bce: 0.01
   lambda_reg: 0.01
   lambda_sky: 0.0
-  lambda_near: 0.0
   min_range_prune: 0.0
-  min_range_push: 0.0
   sky_morph_kernel: 0
   use_rayhit: True
 
