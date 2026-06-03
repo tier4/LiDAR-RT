@@ -485,20 +485,23 @@ def training(args):
                     dmax = float(rendered_depth.max().item())
                 dmin = 0.0
 
-                # Predicted hit mask: any Gaussian intercepted the ray. We
-                # deliberately do NOT filter by the raw raydrop classifier here
-                # — vis_rerun.py uses the same mask to keep the two viewers in
-                # sync (UNet refinement is post-training and unavailable mid-run).
-                # depth < viz_min_depth is filtered out as obvious phantom (the
-                # LiDAR's hardware minimum range is well above this).
+                # Predicted hit: any Gaussian intercepted the ray. Tri-state
+                # for the pred panel: BLACK = no Gaussian (depth==0), MAGENTA
+                # = phantom hit at 0 < depth <= viz_min_depth (hardware-min
+                # violation), JET log-scale = depth > viz_min_depth (normal).
                 rendered_depth_2d = rendered_depth.squeeze(-1).detach().cpu().numpy()
                 gt_depth_np = gt_depth_viz.detach().cpu().numpy()
                 gt_mask_np = gt_mask_viz.detach().cpu().numpy().astype(bool)
                 viz_min_depth = float(getattr(args, "viz_min_depth", 0.0))
-                pred_hit_any = rendered_depth_2d > viz_min_depth
+                pred_hit_any = rendered_depth_2d > 0
+                pred_phantom = pred_hit_any & (rendered_depth_2d <= viz_min_depth)
 
-                gt_depth_img = colorize_depth(gt_depth_np, dmin, dmax, mask=gt_mask_np)
-                pred_depth_img = colorize_depth(rendered_depth_2d, dmin, dmax, mask=pred_hit_any)
+                # log scale so close-range (1-10 m) is not buried at the dark
+                # end of a 0-200 m linear ramp.
+                gt_depth_img = colorize_depth(gt_depth_np, dmin, dmax, mask=gt_mask_np, log_scale=True)
+                pred_depth_img = colorize_depth(rendered_depth_2d, dmin, dmax, mask=pred_hit_any, log_scale=True)
+                if pred_phantom.any():
+                    pred_depth_img[pred_phantom] = (255, 0, 255)  # BGR magenta
 
                 # Per-pixel |gt - pred| at pixels where both are valid.
                 err_valid = gt_mask_np & pred_hit_any

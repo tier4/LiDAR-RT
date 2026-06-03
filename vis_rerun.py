@@ -382,15 +382,19 @@ def main():
 
             gt_depth_2d = gt_depth_np.squeeze(-1)
             rd_depth_2d = rendered_depth_np.squeeze(-1)
-            pred_hit_any = rd_depth_2d > viz_min_depth
+            pred_hit_any = rd_depth_2d > 0
+            pred_phantom = pred_hit_any & (rd_depth_2d <= viz_min_depth)
 
-            # colorize_depth returns BGR; rerun expects RGB
-            gt_dvis = cv2.cvtColor(
-                colorize_depth(gt_depth_2d, dmin, dmax, mask=gt_mask_2d), cv2.COLOR_BGR2RGB
-            )
-            rd_vis = cv2.cvtColor(
-                colorize_depth(rd_depth_2d, dmin, dmax, mask=pred_hit_any), cv2.COLOR_BGR2RGB
-            )
+            # colorize_depth returns BGR; rerun expects RGB. log scale so
+            # close-range is not buried at the dark end. Phantom pixels
+            # (0 < depth <= viz_min_depth) are painted magenta so they stand
+            # out from genuine "no Gaussian hit" (black).
+            gt_bgr = colorize_depth(gt_depth_2d, dmin, dmax, mask=gt_mask_2d, log_scale=True)
+            rd_bgr = colorize_depth(rd_depth_2d, dmin, dmax, mask=pred_hit_any, log_scale=True)
+            if pred_phantom.any():
+                rd_bgr[pred_phantom] = (255, 0, 255)  # BGR magenta
+            gt_dvis = cv2.cvtColor(gt_bgr, cv2.COLOR_BGR2RGB)
+            rd_vis = cv2.cvtColor(rd_bgr, cv2.COLOR_BGR2RGB)
             rr.log(f"{ri_prefix}/depth/gt", rr.Image(gt_dvis))
             rr.log(f"{ri_prefix}/depth/rendered", rr.Image(rd_vis))
 
