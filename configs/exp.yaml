@@ -41,6 +41,7 @@ opt:
   lambda_intensity_dssim: 0.15
   lambda_raydrop_bce: 0.01
   lambda_reg: 0.01
+  lambda_sky: 0.0
   use_rayhit: True
 
   use_normal_init: True

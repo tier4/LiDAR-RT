@@ -92,7 +92,7 @@ class LiDARRTMeter:
         ).float()  # intensity, hit prob, drop prob
         self.scale = 1.0
         self.intensity_scale = 1.0
-        self.raydrop_ratio = 0.6
+        self.raydrop_ratio = 0.5
         self.colormap = cv2.COLORMAP_JET
 
         self.lpips_fn = lpips.LPIPS(net="alex").eval()

@@ -120,6 +120,7 @@ def training(args):
             "lambda_raydrop_bce": getattr(args.opt, "lambda_raydrop_bce", None),
             "lambda_cd": getattr(args.opt, "lambda_cd", None),
             "lambda_reg": getattr(args.opt, "lambda_reg", None),
+            "lambda_sky": getattr(args.opt, "lambda_sky", None),
             "max_depth": getattr(args, "max_depth", None),
             "densify_until_iter": getattr(args.opt, "densify_until_iter", None),
             "densify_from_iter": getattr(args.opt, "densify_from_iter", None),
@@ -256,7 +257,21 @@ def training(args):
         for gaussians in gaussians_assets:
             loss_reg += args.opt.lambda_reg * gaussians.box_reg_loss()
 
-        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg
+        # === sky transparency loss ===
+        # For sky-direction rays (no GT return), the rendered depth should be 0.
+        # A non-zero rendered depth there means a phantom Gaussian intercepted
+        # the ray; pushing depth toward 0 forces those Gaussians to thin out.
+        lambda_sky = getattr(args.opt, "lambda_sky", 0.0)
+        if lambda_sky > 0:
+            sky_mask = ~gt_mask
+            if sky_mask.any():
+                loss_sky = lambda_sky * depth[sky_mask].abs().mean()
+            else:
+                loss_sky = torch.tensor(0.0, device="cuda")
+        else:
+            loss_sky = torch.tensor(0.0, device="cuda")
+
+        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky
 
         # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
         if not torch.isfinite(loss):
@@ -384,6 +399,8 @@ def training(args):
                         "train/cd_loss": loss_cd.item(),
                         # Regularization
                         "train/reg_loss": loss_reg.item() if isinstance(loss_reg, torch.Tensor) else loss_reg,
+                        # Sky transparency
+                        "train/sky_loss": loss_sky.item(),
                         # Densification
                         "train/points_num": points_num,
                         "train/clone_sum": clone_sum,
