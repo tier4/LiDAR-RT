@@ -92,7 +92,7 @@ class LiDARRTMeter:
         ).float()  # intensity, hit prob, drop prob
         self.scale = 1.0
         self.intensity_scale = 1.0
-        self.raydrop_ratio = 0.4
+        self.raydrop_ratio = 0.6
         self.colormap = cv2.COLORMAP_JET
 
         self.lpips_fn = lpips.LPIPS(net="alex").eval()
@@ -229,22 +229,22 @@ class LiDARRTMeter:
                 np.ones_like(rendered_pts) * 0.9
             )
 
-        rendered_depth = rendered_depth.cpu().numpy()
+        rendered_depth_raw = rendered_depth.cpu().numpy()
         if self.save_image:
-            nonzero_mask = rendered_depth != 0
-            rendered_depth_vis = (rendered_depth - gt_depth.min()) / (
+            nonzero_mask = rendered_depth_raw != 0
+            rendered_depth_vis = (rendered_depth_raw - gt_depth.min()) / (
                 gt_depth.max() - gt_depth.min()
             )
             rendered_depth_vis = (
                 color_mapping(rendered_depth_vis[..., 0], colormap_) * 255
             ).astype(np.uint8)
             rendered_depth_vis = rendered_depth_vis * (mask & nonzero_mask)
-        rendered_depth = rendered_depth * mask
+        rendered_depth = rendered_depth_raw * mask
 
-        rendered_intensity = rendered_intensity.clamp(0, 1.0).cpu().numpy()
+        rendered_intensity_raw = rendered_intensity.clamp(0, 1.0).cpu().numpy()
         if self.save_image:
-            nonzero_mask = rendered_intensity != 0
-            rendered_intensity_vis = rendered_intensity
+            nonzero_mask = rendered_intensity_raw != 0
+            rendered_intensity_vis = rendered_intensity_raw
             rendered_intensity_vis = (rendered_intensity_vis - gt_intensity.min()) / (
                 gt_intensity.max() - gt_intensity.min()
             )
@@ -252,12 +252,14 @@ class LiDARRTMeter:
                 color_mapping(rendered_intensity_vis[..., 0], colormap_) * 255
             ).astype(np.uint8)
             rendered_intensity_vis = rendered_intensity_vis * (mask & nonzero_mask)
-        rendered_intensity = rendered_intensity * mask
+        rendered_intensity = rendered_intensity_raw * mask
 
         render_dict.update(
             {
                 "rendered_depth": rendered_depth,
                 "rendered_intensity": rendered_intensity,
+                "rendered_depth_raw": rendered_depth_raw,
+                "rendered_intensity_raw": rendered_intensity_raw,
                 "rendered_rayhit": rendered_rayhit,
                 "gt_depth": gt_depth,
                 "gt_intensity": gt_intensity,
@@ -305,55 +307,87 @@ class LiDARRTMeter:
         fscore[torch.isnan(fscore)] = 0
         return [fscore, precision_1, precision_2]
 
-    def compute_depth_metrics(self, gt, pred, min_depth=1e-6, max_depth=80):
+    def compute_depth_metrics(self, gt, pred, min_depth=1e-6, max_depth=80, valid_mask=None):
         pred[pred < min_depth] = min_depth
         pred[pred > max_depth] = max_depth
         gt[gt < min_depth] = min_depth
         gt[gt > max_depth] = max_depth
 
-        rmse = (gt - pred) ** 2
-        rmse = np.sqrt(rmse.mean())
+        # Point-wise metrics: compute only on valid (hit) pixels
+        if valid_mask is not None:
+            mask = valid_mask.squeeze(-1).astype(bool) if valid_mask.ndim == 3 else valid_mask.astype(bool)
+            gt_valid = gt.squeeze(-1)[mask] if gt.ndim == 3 else gt[mask]
+            pred_valid = pred.squeeze(-1)[mask] if pred.ndim == 3 else pred[mask]
+        else:
+            gt_valid = gt.ravel()
+            pred_valid = pred.ravel()
 
-        mae = np.mean(np.abs(gt - pred))
-        medae = np.median(np.abs(gt - pred))
+        rmse = np.sqrt(np.mean((gt_valid - pred_valid) ** 2))
+        mae = np.mean(np.abs(gt_valid - pred_valid))
+        medae = np.median(np.abs(gt_valid - pred_valid))
+        psnr_loss = 10 * np.log10(max_depth**2 / np.mean((pred_valid - gt_valid) ** 2))
 
-        psnr_loss = 10 * np.log10(max_depth**2 / np.mean((pred - gt) ** 2))
+        # Image-level metrics: mask both gt and pred consistently
+        if valid_mask is not None:
+            mask_3d = valid_mask if valid_mask.ndim == 3 else valid_mask[..., np.newaxis]
+            pred_masked = pred * mask_3d
+            gt_masked = gt * mask_3d
+        else:
+            pred_masked = pred
+            gt_masked = gt
 
         ssim_loss = structural_similarity(
-            pred.squeeze(-1), gt.squeeze(-1), data_range=np.max(gt) - np.min(gt)
+            pred_masked.squeeze(-1), gt_masked.squeeze(-1),
+            data_range=np.max(gt_masked) - np.min(gt_masked),
         )
 
         lpips_loss = self.lpips_fn(
-            torch.from_numpy(pred).permute(2, 0, 1),
-            torch.from_numpy(gt).permute(2, 0, 1),
+            torch.from_numpy(pred_masked).permute(2, 0, 1),
+            torch.from_numpy(gt_masked).permute(2, 0, 1),
             normalize=True,
         ).item()
 
         return [rmse, mae, medae, lpips_loss, ssim_loss, psnr_loss]
 
     def compute_intensity_metrics(
-        self, gt, pred, min_intensity=1e-6, max_intensity=1.0
+        self, gt, pred, min_intensity=1e-6, max_intensity=1.0, valid_mask=None
     ):
         pred[pred < min_intensity] = min_intensity
         pred[pred > max_intensity] = max_intensity
         gt[gt < min_intensity] = min_intensity
         gt[gt > max_intensity] = max_intensity
 
-        rmse = (gt - pred) ** 2
-        rmse = np.sqrt(rmse.mean())
+        # Point-wise metrics: compute only on valid (hit) pixels
+        if valid_mask is not None:
+            mask = valid_mask.squeeze(-1).astype(bool) if valid_mask.ndim == 3 else valid_mask.astype(bool)
+            gt_valid = gt.squeeze(-1)[mask] if gt.ndim == 3 else gt[mask]
+            pred_valid = pred.squeeze(-1)[mask] if pred.ndim == 3 else pred[mask]
+        else:
+            gt_valid = gt.ravel()
+            pred_valid = pred.ravel()
 
-        mae = np.mean(np.abs(gt - pred))
-        medae = np.median(np.abs(gt - pred))
+        rmse = np.sqrt(np.mean((gt_valid - pred_valid) ** 2))
+        mae = np.mean(np.abs(gt_valid - pred_valid))
+        medae = np.median(np.abs(gt_valid - pred_valid))
+        psnr_loss = 10 * np.log10(max_intensity**2 / np.mean((pred_valid - gt_valid) ** 2))
 
-        psnr_loss = 10 * np.log10(max_intensity**2 / np.mean((pred - gt) ** 2))
+        # Image-level metrics: mask both gt and pred consistently
+        if valid_mask is not None:
+            mask_3d = valid_mask if valid_mask.ndim == 3 else valid_mask[..., np.newaxis]
+            pred_masked = pred * mask_3d
+            gt_masked = gt * mask_3d
+        else:
+            pred_masked = pred
+            gt_masked = gt
 
         ssim_loss = structural_similarity(
-            pred.squeeze(-1), gt.squeeze(-1), data_range=np.max(gt) - np.min(gt)
+            pred_masked.squeeze(-1), gt_masked.squeeze(-1),
+            data_range=np.max(gt_masked) - np.min(gt_masked),
         )
 
         lpips_loss = self.lpips_fn(
-            torch.from_numpy(pred).permute(2, 0, 1),
-            torch.from_numpy(gt).permute(2, 0, 1),
+            torch.from_numpy(pred_masked).permute(2, 0, 1),
+            torch.from_numpy(gt_masked).permute(2, 0, 1),
             normalize=True,
         ).item()
 
@@ -422,12 +456,16 @@ class LiDARRTMeter:
             )
 
             max_depth = getattr(self.args, "max_depth", 80)
+            valid_mask = render_dict["gt_rayhit"]
             depth_per_frame = self.compute_depth_metrics(
-                render_dict["gt_depth"], render_dict["rendered_depth"],
-                max_depth=max_depth,
+                render_dict["gt_depth"].copy(),
+                render_dict["rendered_depth_raw"].copy(),
+                max_depth=max_depth, valid_mask=valid_mask,
             )
             intensity_per_frame = self.compute_intensity_metrics(
-                render_dict["gt_intensity"], render_dict["rendered_intensity"]
+                render_dict["gt_intensity"].copy(),
+                render_dict["rendered_intensity_raw"].copy(),
+                valid_mask=valid_mask,
             )
             raydrop_per_frame = self.compute_raydrop_metrics(
                 1 - render_dict["gt_rayhit"], 1 - render_dict["rendered_rayhit"]

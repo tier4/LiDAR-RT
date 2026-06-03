@@ -26,7 +26,7 @@ from lib.scene.unet import UNet
 from lib.utils.image_utils import color_mapping
 from tqdm import tqdm
 
-RAYDROP_RATIO = 0.4
+RAYDROP_RATIO = 0.6
 COLORMAP = 20  # JET
 
 

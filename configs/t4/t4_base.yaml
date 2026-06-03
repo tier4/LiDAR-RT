@@ -1,67 +1,67 @@
 data_type: "T4"
 
 # Multi-LiDAR configuration
-# Each sensor is loaded individually from rosbag via t4-devkit
+# Each sensor is loaded individually from rosbag via t4-devkit.
+# sensor2ego transforms are automatically read from /tf_static in the rosbag.
 lidar_sensors:
   - name: hesai_top
     topic: "/sensing/lidar/top/pandar_packets"
+    sensor_type: "OT128"
+    frame_id: "hesai_top"
     range_image_height: 128
     range_image_width: 1800
     inc_bottom: -25.0
     inc_top: 15.0
     max_depth: 200.0
-    # sensor2ego: translation [x, y, z], rotation [qw, qx, qy, qz]
-    sensor2ego_translation: [0.0, 0.0, 0.0]
-    sensor2ego_rotation: [1.0, 0.0, 0.0, 0.0]
 
   - name: hesai_front_left
     topic: "/sensing/lidar/front_left/pandar_packets"
+    sensor_type: "XT32"
+    frame_id: "hesai_front_left"
     range_image_height: 32
     range_image_width: 1800
     inc_bottom: -16.0
     inc_top: 15.0
     max_depth: 120.0
-    sensor2ego_translation: [0.0, 0.0, 0.0]
-    sensor2ego_rotation: [1.0, 0.0, 0.0, 0.0]
 
   - name: hesai_front_right
     topic: "/sensing/lidar/front_right/pandar_packets"
+    sensor_type: "XT32"
+    frame_id: "hesai_front_right"
     range_image_height: 32
     range_image_width: 1800
     inc_bottom: -16.0
     inc_top: 15.0
     max_depth: 120.0
-    sensor2ego_translation: [0.0, 0.0, 0.0]
-    sensor2ego_rotation: [1.0, 0.0, 0.0, 0.0]
 
   - name: hesai_side_left
     topic: "/sensing/lidar/side_left/pandar_packets"
+    sensor_type: "XT32"
+    frame_id: "hesai_side_left"
     range_image_height: 32
     range_image_width: 1800
     inc_bottom: -16.0
     inc_top: 15.0
     max_depth: 120.0
-    sensor2ego_translation: [0.0, 0.0, 0.0]
-    sensor2ego_rotation: [1.0, 0.0, 0.0, 0.0]
 
   - name: hesai_side_right
     topic: "/sensing/lidar/side_right/pandar_packets"
+    sensor_type: "XT32"
+    frame_id: "hesai_side_right"
     range_image_height: 32
     range_image_width: 1800
     inc_bottom: -16.0
     inc_top: 15.0
     max_depth: 120.0
-    sensor2ego_translation: [0.0, 0.0, 0.0]
-    sensor2ego_rotation: [1.0, 0.0, 0.0, 0.0]
 
   - name: hesai_rear
     topic: "/sensing/lidar/rear/pandar_packets"
+    sensor_type: "XT32"
+    frame_id: "hesai_rear"
     range_image_height: 32
     range_image_width: 1800
     inc_bottom: -16.0
     inc_top: 15.0
     max_depth: 120.0
-    sensor2ego_translation: [0.0, 0.0, 0.0]
-    sensor2ego_rotation: [1.0, 0.0, 0.0, 0.0]
 
 max_depth: 200.0

@@ -47,6 +47,13 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+try:
+    import wandb
+
+    WANDB_FOUND = True
+except ImportError:
+    WANDB_FOUND = False
+
 
 def set_seed(seed):
     """
@@ -92,6 +99,39 @@ def training(args):
         )
     )
     print("Output dir: ", output_dir)
+
+    # Initialize wandb
+    if WANDB_FOUND:
+        wandb_config = {
+            "task_name": args.task_name,
+            "exp_name": args.exp_name,
+            "scene_id": args.scene_id,
+            "data_type": getattr(args, "data_type", None),
+            "iterations": args.opt.iterations,
+            "lr_xyz": getattr(args.opt, "position_lr_init", None),
+            "lr_feature": getattr(args.opt, "feature_lr", None),
+            "lr_opacity": getattr(args.opt, "opacity_lr", None),
+            "lr_scaling": getattr(args.opt, "scaling_lr", None),
+            "lr_rotation": getattr(args.opt, "rotation_lr", None),
+            "lambda_depth_l1": getattr(args.opt, "lambda_depth_l1", None),
+            "lambda_intensity_l1": getattr(args.opt, "lambda_intensity_l1", None),
+            "lambda_intensity_l2": getattr(args.opt, "lambda_intensity_l2", None),
+            "lambda_intensity_dssim": getattr(args.opt, "lambda_intensity_dssim", None),
+            "lambda_raydrop_bce": getattr(args.opt, "lambda_raydrop_bce", None),
+            "lambda_cd": getattr(args.opt, "lambda_cd", None),
+            "lambda_reg": getattr(args.opt, "lambda_reg", None),
+            "max_depth": getattr(args, "max_depth", None),
+            "densify_until_iter": getattr(args.opt, "densify_until_iter", None),
+            "densify_from_iter": getattr(args.opt, "densify_from_iter", None),
+            "densification_interval": getattr(args.opt, "densification_interval", None),
+            "use_refine": getattr(args.refine, "use_refine", False),
+        }
+        wandb.init(
+            entity="advanced-technology-department",
+            project="LiDAR-RT",
+            name=f"{args.exp_name}_scene{scene_id}",
+            config=wandb_config,
+        )
 
     if args.model_path:
         (model_params, first_iter) = torch.load(args.model_path)
@@ -217,7 +257,35 @@ def training(args):
             loss_reg += args.opt.lambda_reg * gaussians.box_reg_loss()
 
         loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg
-        loss.backward()
+
+        # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
+        if not torch.isfinite(loss):
+            print(f"\n[ITER {iteration}] Warning: non-finite loss ({loss.item():.4f}), skipping")
+            for gs in gaussians_assets:
+                gs.optimizer.zero_grad(set_to_none=True)
+            continue
+
+        try:
+            loss.backward()
+        except RuntimeError as e:
+            if "nan" in str(e).lower():
+                print(f"\n[ITER {iteration}] Warning: NaN in backward pass, skipping")
+                for gs in gaussians_assets:
+                    gs.optimizer.zero_grad(set_to_none=True)
+                continue
+            raise
+
+        # Check for NaN gradients and skip if found
+        has_nan_grad = False
+        for gs in gaussians_assets:
+            if gs._xyz.grad is not None and not torch.isfinite(gs._xyz.grad).all():
+                has_nan_grad = True
+                break
+        if has_nan_grad:
+            print(f"\n[ITER {iteration}] Warning: NaN in gradients, skipping")
+            for gs in gaussians_assets:
+                gs.optimizer.zero_grad(set_to_none=True)
+            continue
 
         with torch.no_grad():
             densify_info = scene.optimize(
@@ -267,6 +335,23 @@ def training(args):
 
             reduced_losses = {k: torch.mean(v) for k, v in loss_stats.items()}
             recorder.update_loss_stats(reduced_losses)
+
+            if WANDB_FOUND:
+                wandb.log(
+                    {
+                        "train/loss": loss.item(),
+                        "train/depth_loss": loss_depth.item(),
+                        "train/intensity_loss": loss_intensity.item(),
+                        "train/raydrop_loss": loss_raydrop.item(),
+                        "train/cd_loss": loss_cd.item(),
+                        "train/reg_loss": loss_reg.item() if isinstance(loss_reg, torch.Tensor) else loss_reg,
+                        "train/depth_mse": depth_mse,
+                        "train/ema_loss": (0.4 * loss + 0.6 * ema_loss_for_log).item(),
+                        "train/points_num": points_num,
+                        "iteration": iteration,
+                    },
+                    step=iteration,
+                )
 
             end = time.time()
             recorder.batch_time.update(batch_time)
@@ -368,6 +453,11 @@ def training(args):
                             mix_metric += psnr_depth + psnr_intensity
                             eval_count += 1
                     mix_metric /= max(eval_count, 1)
+                    if WANDB_FOUND:
+                        wandb.log(
+                            {"eval/mix_metric": mix_metric, "iteration": iteration},
+                            step=iteration,
+                        )
                     print(mix_metric, best_mix_metric)
                     if mix_metric > best_mix_metric:
                         for file in os.listdir(scene.model_save_dir):
@@ -555,4 +645,6 @@ if __name__ == "__main__":
     training(args)
 
     # All done
+    if WANDB_FOUND:
+        wandb.finish()
     print(blue("\nTraining complete."))

@@ -88,25 +88,35 @@ class SceneLidar(Scene):
         all_intensity = []
         all_normals = []
         for frame in range(frame_range[0], frame_range[1] + 1):
-            # Collect points from all sensors for this frame
+            # Collect points and normals per-sensor from r1 range image (GPU, fast)
             frame_pts_list = []
             frame_int_list = []
+            frame_normals_list = []
             for sensor_name, lidar in self.train_lidars.items():
-                pts, intensity = lidar.inverse_projection(frame)
+                depth = lidar.get_depth(frame)  # (H, W)
+                intensity_map = lidar.get_intensity(frame)  # (H, W)
+                hit_mask = lidar.get_mask(frame)  # (H, W)
+                # Points from r1 range image
+                pts_3d = lidar.range2point(frame, depth)  # (H, W, 3) on GPU
+                pts = pts_3d[hit_mask].cpu()
+                intensity = intensity_map[hit_mask].cpu()
+                # Normals from range image finite differences (GPU)
+                normal_map = lidar.get_normal(frame)[0]  # (H, W, 3)
+                sensor_normals = normal_map[hit_mask].cpu()
+                # Replace zero normals (boundary pixels) with random unit vectors
+                zero_mask = (sensor_normals.norm(dim=-1) < 1e-6)
+                if zero_mask.any():
+                    n_zero = zero_mask.sum().item()
+                    rand_normals = torch.randn(n_zero, 3)
+                    rand_normals = rand_normals / rand_normals.norm(dim=-1, keepdim=True)
+                    sensor_normals[zero_mask] = rand_normals
                 frame_pts_list.append(pts)
                 frame_int_list.append(intensity)
+                frame_normals_list.append(sensor_normals)
 
             lidar_pts = torch.cat(frame_pts_list, dim=0)
             lidar_intensity = torch.cat(frame_int_list, dim=0)
-
-            points_lidar = o3d.geometry.PointCloud()
-            points_lidar.points = o3d.utility.Vector3dVector(
-                lidar_pts.cpu().numpy().astype(np.float64)
-            )
-            points_lidar.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamKNN(knn=6)
-            )
-            normals = torch.from_numpy(np.asarray(points_lidar.normals)).float()
+            normals = torch.cat(frame_normals_list, dim=0)
             for gaussian_model in self.gaussians_assets[1:]:
                 bbox = gaussian_model.bounding_box
                 T = bbox.frame[frame][0].cpu()
@@ -280,7 +290,10 @@ class SceneLidar(Scene):
             begin_index += points_num
 
             # Densification
-            if iteration < args.opt.densify_until_iter:
+            max_points = getattr(args.opt, "densify_until_num_points", -1)
+            total_points = sum(g.get_local_xyz.shape[0] for g in self.gaussians_assets)
+            points_under_cap = max_points < 0 or total_points < max_points
+            if iteration < args.opt.densify_until_iter and points_under_cap:
                 gaussians.add_densification_stats(
                     instance_mean_grads, instance_accum_weights
                 )
