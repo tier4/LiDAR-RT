@@ -18,6 +18,7 @@ __pycache__/
 *.pkl
 *.ply
 .DS_Store
+.venv
 
 data/
 logs/
