@@ -174,15 +174,34 @@ def depth_to_colors(depth, vmin=0.0, vmax=120.0):
     return colors.reshape(-1, 3)[:, ::-1].copy()  # BGR -> RGB
 
 
-def intensity_to_point_colors(intensity_1d, fade=0.0):
-    """Map (N,) intensity in [0, 1] to (N, 3) RGB uint8 via the JET colormap.
+def intensity_to_point_colors(intensity_1d, fade=0.0,
+                              vmin=0.0, vmax=64.0, log_scale=True):
+    """Map (N,) intensity in raw LiDAR scale to (N, 3) RGB uint8 via the JET
+    colormap.
 
-    fade in [0, 1] blends the result toward pure white so the same colormap
-    can be reused with different visual weights — used to render the GT cloud
-    as a pale wash and the rendered cloud at full saturation in the same scene.
+    T4 LiDAR intensity is uint8 in raw 0-255 with a heavy long-tail
+    distribution (p50 ≈ 12, p90 ≈ 30, p99 ≈ 64, retroreflectors at 255).
+    A linear [0, 255] ramp wastes most of the colormap on the empty
+    high-intensity tail, while a linear [0, 1] mapping clips ~99% of points
+    to the top of the ramp. Defaulting to log-scale [0, 64] spreads the
+    visible spectrum across the meaningful band where 99% of points live;
+    anything above 64 saturates to the top color (deep red) instead of
+    pulling the rest of the distribution into blue.
+
+    fade in [0, 1] blends toward white for the GT "pale wash" look so a
+    saturated rendered cloud can be visually distinguished from a faded GT
+    one when overlaid in the 3D view.
     """
-    norm = (np.clip(intensity_1d, 0.0, 1.0) * 255).astype(np.uint8).reshape(-1, 1)
-    bgr = cv2.applyColorMap(norm, cv2.COLORMAP_JET).reshape(-1, 3)
+    v = np.asarray(intensity_1d, dtype=np.float32)
+    if log_scale:
+        v = np.log1p(np.maximum(v, 0.0))
+        lo = np.log1p(max(vmin, 0.0))
+        hi = np.log1p(max(vmax, vmin + 1e-3))
+    else:
+        lo, hi = float(vmin), float(vmax)
+    norm = np.clip((v - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    norm_u8 = (norm * 255).astype(np.uint8).reshape(-1, 1)
+    bgr = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET).reshape(-1, 3)
     rgb = bgr[:, ::-1].astype(np.float32)
     if fade > 0:
         rgb = rgb * (1.0 - fade) + 255.0 * fade
@@ -361,14 +380,21 @@ def main():
             # Ground truth
             gt_rayhit = lidar.get_mask(frame_id).unsqueeze(-1)
             gt_depth = lidar.get_depth(frame_id)
-            gt_intensity = lidar.get_intensity(frame_id).clamp(0, 1)
+            # Raw intensity (T4: uint8 0-255). Kept un-clamped for the 3D
+            # point-cloud colormap which now handles the raw scale natively
+            # with log-range mapping. The clamped [0, 1] version stays for
+            # the 2D range-image viz which still expects normalised input.
+            gt_intensity_raw = lidar.get_intensity(frame_id)
+            gt_intensity = gt_intensity_raw.clamp(0, 1)
 
             gt_rayhit_np = gt_rayhit.cpu().numpy()
             gt_depth_np = gt_depth.unsqueeze(-1).cpu().numpy()
             gt_intensity_np = gt_intensity.unsqueeze(-1).cpu().numpy()
+            gt_intensity_raw_np = gt_intensity_raw.cpu().numpy()
             rendered_rayhit_np = (rendered_raydrop < RAYDROP_RATIO).cpu().numpy()
             rendered_depth_np = rendered_depth.cpu().numpy()
             rendered_intensity_np = rendered_intensity.clamp(0, 1).cpu().numpy()
+            rendered_intensity_raw_np = rendered_intensity.cpu().numpy()
             mask = rendered_rayhit_np
 
             # 3D point clouds. Filter out unrealistic close-range hits so the
@@ -385,14 +411,15 @@ def main():
             gt_pts = gt_all_pts[gt_mask_2d] - origin_offset
             rendered_pts = rd_all_pts[rd_mask_2d] - origin_offset
 
-            # Per-point intensity colors. Both clouds use the same JET ramp on
-            # the [0, 1] intensity range, but GT is heavily faded toward white
-            # while rendered stays saturated — same colormap, different visual
-            # weight, so the two clouds remain distinguishable when overlaid
-            # in the 3D view. `sensor_color` is intentionally not used here:
-            # the per-sensor entity paths still keep them toggleable.
-            gt_int_vals = gt_intensity_np.squeeze(-1)[gt_mask_2d]
-            rd_int_vals = rendered_intensity_np.squeeze(-1)[rd_mask_2d]
+            # Per-point intensity colors. Both clouds run through the same
+            # log-ramp colormap on raw intensity (default [0, 64] which
+            # covers p99 of T4 LiDAR), but GT is heavily faded toward white
+            # while rendered stays saturated — same colormap, different
+            # visual weight, so the two clouds remain distinguishable when
+            # overlaid in the 3D view. `sensor_color` is intentionally not
+            # used: the per-sensor entity paths still keep them toggleable.
+            gt_int_vals = gt_intensity_raw_np[gt_mask_2d]
+            rd_int_vals = rendered_intensity_raw_np.squeeze(-1)[rd_mask_2d]
             gt_colors = intensity_to_point_colors(gt_int_vals, fade=0.65)
             rd_colors = intensity_to_point_colors(rd_int_vals, fade=0.0)
 
