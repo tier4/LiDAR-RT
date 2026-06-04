@@ -570,6 +570,27 @@ def training(args):
                 if pred_phantom.any():
                     pred_depth_img[pred_phantom] = (255, 0, 255)  # BGR magenta
 
+                # Background-only render: same viewpoint, but with object
+                # Gaussians stripped from the asset list. Lets us see what the
+                # static background alone is reconstructing — useful for
+                # diagnosing whether near-range / dynamic-object hits in the
+                # full-asset panel are coming from bg phantoms or genuine
+                # tracked-object Gaussians.
+                if len(gaussians_assets) > 1:
+                    bg_render_pkg = raytracing(
+                        viz_frame, [gaussians_assets[0]], scene.train_lidar,
+                        background, args,
+                    )
+                    bg_depth_2d = bg_render_pkg["depth"].squeeze(-1).detach().cpu().numpy()
+                else:
+                    bg_depth_2d = rendered_depth_2d
+                bg_hit_any = bg_depth_2d > 0
+                bg_phantom = bg_hit_any & (bg_depth_2d <= viz_min_depth)
+                bg_depth_img = colorize_depth(bg_depth_2d, dmin, dmax,
+                                              mask=bg_hit_any, log_scale=True)
+                if bg_phantom.any():
+                    bg_depth_img[bg_phantom] = (255, 0, 255)  # BGR magenta
+
                 # Per-pixel |gt - pred| at pixels where both are valid.
                 err_valid = gt_mask_np & pred_hit_any
                 err_map = np.zeros_like(gt_depth_np, dtype=np.float32)
@@ -586,7 +607,7 @@ def training(args):
                 error_img = colorize_depth(err_map, 0.0, err_cap, mask=err_valid)
 
                 concat_image = np.concatenate(
-                    [gt_depth_img, pred_depth_img, error_img], axis=0
+                    [gt_depth_img, pred_depth_img, bg_depth_img, error_img], axis=0
                 )
                 rgb_image = concat_image
                 os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
@@ -603,7 +624,8 @@ def training(args):
                             cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB),
                             caption=(
                                 f"iter {iteration} | frame {viz_frame} | top→bot: "
-                                f"depth_gt / depth_rendered / error (cap={err_cap:.2f}m)"
+                                f"depth_gt / depth_rendered(all) / depth_rendered(bg only) / "
+                                f"error (cap={err_cap:.2f}m)"
                             ),
                         ),
                     }, step=iteration)
