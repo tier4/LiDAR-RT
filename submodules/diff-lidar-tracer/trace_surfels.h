@@ -26,7 +26,7 @@ BuildAccelerationStructure(
     unsigned int rebuild);
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 TraceSurfelsCUDA(
     const OptiXStateWrapper& stateWrapper,
     const bool training,
@@ -47,7 +47,8 @@ TraceSurfelsCUDA(
     const torch::Tensor& projmatrix,
     const torch::Tensor& campos,
     const bool prefiltered,
-    const bool debug);
+    const bool debug,
+    const torch::Tensor& pixel_weight);
 
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

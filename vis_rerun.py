@@ -236,9 +236,13 @@ def main():
 
     # --- Static logging ---
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    # Flag post-prune checkpoints (produced by sky_prune_checkpoint.py) so the
+    # viewer header makes the variant unambiguous when flipping between runs.
+    is_post_prune = "_skyprune" in os.path.basename(args.model_path)
     rr.log("metadata", rr.TextDocument(
-        f"Model: {args.model_path}\nIteration: {first_iter}\n"
-        f"Frames: {len(all_frames)} ({args.eval_type})\n"
+        f"Model: {args.model_path}\nIteration: {first_iter}"
+        + ("  [POST-PRUNE]" if is_post_prune else "")
+        + f"\nFrames: {len(all_frames)} ({args.eval_type})\n"
         f"Sensors: {', '.join(sensor_names)}"
     ))
 

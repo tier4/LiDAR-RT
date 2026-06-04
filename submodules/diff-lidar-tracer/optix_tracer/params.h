@@ -63,6 +63,14 @@ struct Params
     float* out_attr_float32;  // (H, W, C), RGB color or other features
     int* out_attr_uint32;
     float* accum_gaussian_weights;
+
+    // Optional per-pixel weight (H, W) and per-Gaussian sky-weighted accumulator (P).
+    // When pixel_weight is non-null, the kernel adds alpha*T*pixel_weight[tidx] to
+    // accum_gaussian_sky_weights[gidx] for every contributing Gaussian — used by the
+    // sky-mask hard-prune path to detect Gaussians whose rendering contribution
+    // concentrates in sky pixels across many views.
+    float* pixel_weight;
+    float* accum_gaussian_sky_weights;
     
     // Input upstream gradients
     float* dL_dout_attr_float32;  // (H, W, C), gradient of RGB color or other features

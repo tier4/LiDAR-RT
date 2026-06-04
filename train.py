@@ -87,6 +87,7 @@ def training(args):
         "split_sum": [],
         "prune_scale_sum": [],
         "prune_opacity_sum": [],
+        "prune_sky_sum": [],
     }
     scene_id = str(args.scene_id) if isinstance(args.scene_id, int) else args.scene_id
     output_dir = os.path.join(
@@ -194,8 +195,27 @@ def training(args):
         if args.pipe.debug_from and (iteration - 1) == args.pipe.debug_from:
             args.pipe.debug = True
 
+        # Compute sky mask up front so we can pass it as pixel_weight to the
+        # rasterizer — the kernel then accumulates per-Gaussian alpha*T*sky for
+        # the sky hard-prune path. The same mask is reused below for the
+        # sky/free-space losses to avoid double computation.
+        gt_mask = cur_lidar.get_mask(frame).cuda()
+        sky_kernel = int(getattr(args.opt, "sky_morph_kernel", 3))
+        if sky_kernel > 1:
+            gt_f = gt_mask.float().unsqueeze(0).unsqueeze(0)
+            pad = sky_kernel // 2
+            dilated = F.max_pool2d(gt_f, sky_kernel, stride=1, padding=pad)
+            closed = -F.max_pool2d(-dilated, sky_kernel, stride=1, padding=pad)
+            gt_mask_closed = closed.squeeze(0).squeeze(0) > 0.5
+            sky_mask = ~gt_mask_closed
+        else:
+            sky_mask = ~gt_mask
+        sky_prune_enabled = bool(getattr(args.opt, "sky_prune_enabled", False))
+        pixel_weight = sky_mask.float() if sky_prune_enabled else None
+
         render_pkg = raytracing(
-            frame, gaussians_assets, cur_lidar, background, args
+            frame, gaussians_assets, cur_lidar, background, args,
+            pixel_weight=pixel_weight,
         )
         batch_time = time.time() - end
         depth = render_pkg["depth"]
@@ -204,10 +224,9 @@ def training(args):
         accum = render_pkg["accum"]
         means3d = render_pkg["means3D"]
         acc_wet = render_pkg["accum_gaussian_weight"]
+        acc_sky_wet = render_pkg["accum_gaussian_sky_weight"]
 
         H, W = depth.shape[0], depth.shape[1]
-
-        gt_mask = cur_lidar.get_mask(frame).cuda()
 
         # === Depth loss ===
         depth = depth.squeeze(-1)
@@ -278,26 +297,13 @@ def training(args):
         # receives much weaker pressure than the nominal lambda suggests. The
         # per-phantom mean keeps the gradient magnitude scene-invariant.
         lambda_sky = getattr(args.opt, "lambda_sky", 0.0)
-        sky_kernel = int(getattr(args.opt, "sky_morph_kernel", 3))
         if lambda_sky > 0:
-            if sky_kernel > 1:
-                # Fill small holes in gt_mask via morphological closing
-                # (dilation then erosion) implemented with max_pool2d.
-                gt_f = gt_mask.float().unsqueeze(0).unsqueeze(0)
-                pad = sky_kernel // 2
-                dilated = F.max_pool2d(gt_f, sky_kernel, stride=1, padding=pad)
-                closed = -F.max_pool2d(-dilated, sky_kernel, stride=1, padding=pad)
-                gt_mask_closed = closed.squeeze(0).squeeze(0) > 0.5
-                sky_mask = ~gt_mask_closed
-            else:
-                sky_mask = ~gt_mask
             phantom_in_sky = sky_mask & (depth > 0)
             if phantom_in_sky.any():
                 loss_sky = lambda_sky * depth[phantom_in_sky].mean()
             else:
                 loss_sky = torch.tensor(0.0, device="cuda")
         else:
-            sky_mask = ~gt_mask
             loss_sky = torch.tensor(0.0, device="cuda")
 
         # === free-space loss ===
@@ -352,7 +358,8 @@ def training(args):
 
         with torch.no_grad():
             densify_info = scene.optimize(
-                args, iteration, means3d.grad, acc_wet, None, None
+                args, iteration, means3d.grad, acc_wet, None, None,
+                sky_weights=acc_sky_wet,
             )
 
             points_num = 0
@@ -381,12 +388,18 @@ def training(args):
                 if log["prune_opacity_sum"]
                 else densify_info[3]
             )
+            prune_sky_sum = (
+                densify_info[4] + log["prune_sky_sum"][-1]
+                if log.get("prune_sky_sum")
+                else densify_info[4]
+            )
             log["depth_mse"].append(depth_mse)
             log["points_num"].append(points_num)
             log["clone_sum"].append(clone_sum)
             log["split_sum"].append(split_sum)
             log["prune_scale_sum"].append(prune_scale_sum)
             log["prune_opacity_sum"].append(prune_opacity_sum)
+            log.setdefault("prune_sky_sum", []).append(prune_sky_sum)
 
             # prepare loss stats for tensorboard record
             loss_stats = {
@@ -457,6 +470,7 @@ def training(args):
                         "train/split_sum": split_sum,
                         "train/prune_scale_sum": prune_scale_sum,
                         "train/prune_opacity_sum": prune_opacity_sum,
+                        "train/prune_sky_sum": prune_sky_sum,
                         # Learning rate
                         "train/lr_xyz": gaussians_assets[0].optimizer.param_groups[0]["lr"],
                     },
@@ -659,6 +673,48 @@ def training(args):
                 logging(log, output_dir)
 
         iter_end.record()
+
+    # Final sky-mask hard prune: deterministic full-view sweep over every
+    # training (sensor, frame), then prune background Gaussians whose
+    # sky-pixel contribution concentrates across enough views. Catches any
+    # sky phantoms that survived the in-training densify-time prune (which
+    # only sees the per-cycle 100-iter window). Gated on sky_prune_enabled
+    # — disable via sky_prune_final_sweep=false in config to skip just the
+    # final pass while keeping the in-training one.
+    sky_prune_enabled_global = bool(getattr(args.opt, "sky_prune_enabled", False))
+    final_sweep_enabled = bool(getattr(args.opt, "sky_prune_final_sweep", True))
+    if (not args.only_refine
+            and sky_prune_enabled_global
+            and final_sweep_enabled):
+        from lib.scene.sky_prune import sweep_and_sky_prune
+        ratio_thr = float(getattr(args.opt, "sky_prune_pixel_ratio_threshold", 0.8))
+        view_cons = float(getattr(args.opt, "sky_prune_view_consistency_threshold", 0.8))
+        min_v = int(getattr(args.opt, "sky_prune_min_views", 3))
+        min_tc = float(getattr(args.opt, "sky_prune_min_total_contrib", 1e-3))
+        print(f"\n[Final sky-prune] sweeping with ratio>{ratio_thr}, "
+              f"view_consistency>{view_cons}, min_views={min_v}")
+        with torch.no_grad():
+            stats = sweep_and_sky_prune(
+                gaussians_assets,
+                scene.train_lidars,
+                args,
+                ratio_threshold=ratio_thr,
+                view_consistency=view_cons,
+                min_views=min_v,
+                min_total_contrib=min_tc,
+                progress_desc="Final sky-prune sweep",
+            )
+        for i, st in stats["per_asset"].items():
+            print(f"  asset[{i}] (bg) Gaussians={st['n_before']}  "
+                  f"observed_any={st['observed_any']}  "
+                  f"observed>={min_v}={st['observed_min']}  "
+                  f"to_prune={st['n_prune']}")
+        print(f"[Final sky-prune] total hard-pruned: {stats['pruned']}")
+        scene.save(args.opt.iterations,
+                   "model_it_" + str(args.opt.iterations) + "_skyprune")
+        if WANDB_FOUND:
+            wandb.log({"train/final_sky_prune_total": stats["pruned"]},
+                      step=args.opt.iterations)
 
     if args.refine.use_refine:
         print(output_dir)

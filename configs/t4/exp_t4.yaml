@@ -46,6 +46,27 @@ opt:
   min_range_prune: 1.0   # Hard-prune background Gaussians within this distance from any sensor
   sky_morph_kernel: 5    # Morphological closing kernel applied to gt_mask before sky loss
                          #   (0/1 = disabled, 3 fills 1-pix holes, 5 fills 2-pix holes)
+
+  # Sky-mask hard-prune: opt-in safety net for sky phantom Gaussians that the
+  # depth/free-space losses fail to thin out. The rasterizer computes per-
+  # Gaussian alpha*T weighted by the sky mask; a Gaussian is judged "sky in
+  # this view" when (sky_contribution / total_contribution) exceeds
+  # sky_prune_pixel_ratio_threshold AND its total_contribution exceeds
+  # sky_prune_min_total_contrib. At densify time, a Gaussian is removed
+  # outright when at least sky_prune_min_views observations passed AND the
+  # fraction of those views judging it "sky" exceeds
+  # sky_prune_view_consistency_threshold.
+  sky_prune_enabled: true
+  sky_prune_warmup_iter: 3000           # Gate the path until densification has settled
+  sky_prune_pixel_ratio_threshold: 0.8  # per-view sky/total ratio to judge "sky"
+  sky_prune_min_total_contrib: 0.001    # ignore Gaussians barely contributing this view
+  sky_prune_view_consistency_threshold: 0.8  # fraction of observed views that must agree
+  sky_prune_min_views: 3                # minimum #views before any prune decision
+  # Final deterministic sweep after the main training loop ends: re-renders
+  # every training frame once, accumulates per-Gaussian sky stats fresh, and
+  # hard-prunes. Catches phantoms that escaped the in-training 100-iter window.
+  # Saves a separate model_it_<iter>_skyprune.pth checkpoint.
+  sky_prune_final_sweep: true
   use_rayhit: True
 
   use_normal_init: True

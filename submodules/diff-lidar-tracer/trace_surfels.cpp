@@ -148,7 +148,7 @@ void BuildAccelerationStructure(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 TraceSurfelsCUDA(
     const OptiXStateWrapper& stateWrapper,
     const bool training,
@@ -169,7 +169,8 @@ TraceSurfelsCUDA(
     const torch::Tensor& projmatrix,
     const torch::Tensor& campos,
     const bool prefiltered,
-    const bool debug)
+    const bool debug,
+    const torch::Tensor& pixel_weight)
 {
     // Create CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -207,6 +208,9 @@ TraceSurfelsCUDA(
     torch::Tensor out_attr_float32 = torch::zeros({H, W, NUM_CHANNELS_F}, float_opts);  // normal
     torch::Tensor out_attr_uint32 = -1 * torch::ones({H, W, NUM_CHANNELS_I}, int_opts);  // number of contributions
     torch::Tensor accum_gaussian_weights = torch::zeros({P}, float_opts);
+    // Sky-weighted per-Gaussian accumulator. Only meaningful when pixel_weight is
+    // provided (non-empty); otherwise stays at zero and the caller can ignore it.
+    torch::Tensor accum_gaussian_sky_weights = torch::zeros({P}, float_opts);
 
 
     // Create global parameters for the OptiX program
@@ -243,6 +247,10 @@ TraceSurfelsCUDA(
     params.out_attr_float32 = out_attr_float32.contiguous().data_ptr<float>();
     params.out_attr_uint32 = out_attr_uint32.contiguous().data_ptr<int>();
     params.accum_gaussian_weights = accum_gaussian_weights.contiguous().data_ptr<float>();
+    // pixel_weight is optional: caller may pass an empty tensor to skip the
+    // sky-weighted accumulation path entirely.
+    params.pixel_weight = pixel_weight.numel() > 0 ? pixel_weight.contiguous().data_ptr<float>() : nullptr;
+    params.accum_gaussian_sky_weights = accum_gaussian_sky_weights.contiguous().data_ptr<float>();
 
 
     // Allocate memory for the parameters
@@ -260,8 +268,8 @@ TraceSurfelsCUDA(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Return
-    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>(
-        out_attr_float32, out_attr_uint32, accum_gaussian_weights);
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+        out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights);
 }
 
 

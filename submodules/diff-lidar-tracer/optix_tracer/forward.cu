@@ -270,7 +270,13 @@ extern "C" __global__ void __raygen__ot()
             W += w;
 
             atomicAdd(params.accum_gaussian_weights + gidx, w);
-            
+            if (params.pixel_weight != nullptr) {
+                float pw = params.pixel_weight[tidx];
+                if (pw != 0.0f) {
+                    atomicAdd(params.accum_gaussian_sky_weights + gidx, w * pw);
+                }
+            }
+
             // Update transmittence
             T = test_T;
 

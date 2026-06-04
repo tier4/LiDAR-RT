@@ -304,9 +304,17 @@ class SceneLidar(Scene):
         accum_weights,
         visibility_filter_list,
         radii_list,
+        sky_weights=None,
     ):
 
-        clone_num, split_num, prune_scale_num, prune_opacity_num = 0, 0, 0, 0
+        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num = 0, 0, 0, 0, 0
+
+        sky_prune_enabled_global = bool(getattr(args.opt, "sky_prune_enabled", False))
+        sky_prune_warmup_iter = int(getattr(args.opt, "sky_prune_warmup_iter", 0))
+        sky_ratio_threshold = float(getattr(args.opt, "sky_prune_pixel_ratio_threshold", 0.8))
+        sky_min_total_contrib = float(getattr(args.opt, "sky_prune_min_total_contrib", 1e-3))
+        sky_view_consistency = float(getattr(args.opt, "sky_prune_view_consistency_threshold", 0.8))
+        sky_min_views = int(getattr(args.opt, "sky_prune_min_views", 3))
 
         begin_index = 0
         for gaussians in self.gaussians_assets:
@@ -315,6 +323,21 @@ class SceneLidar(Scene):
             instance_accum_weights = (
                 accum_weights[begin_index : begin_index + points_num] > 0
             )
+            # Accumulate sky stats per asset before begin_index advances.
+            # Only background Gaussians (no bounding box) get sky-pruned, since
+            # object Gaussians live inside a tracking box and the sky mask is
+            # not a valid criterion for them.
+            if (sky_weights is not None
+                    and sky_prune_enabled_global
+                    and gaussians.bounding_box is None
+                    and iteration >= sky_prune_warmup_iter):
+                instance_total = accum_weights[begin_index : begin_index + points_num]
+                instance_sky = sky_weights[begin_index : begin_index + points_num]
+                gaussians.add_sky_stats(
+                    instance_total, instance_sky,
+                    min_total_contrib=sky_min_total_contrib,
+                    sky_ratio_threshold=sky_ratio_threshold,
+                )
             begin_index += points_num
 
             # Per-asset cap: each asset (bg, each object) is gated on its
@@ -351,16 +374,25 @@ class SceneLidar(Scene):
                                 center_list.append(c)
                         if center_list:
                             sensor_centers = torch.stack(center_list).cuda()
+                    asset_sky_prune_enabled = (
+                        sky_prune_enabled_global
+                        and gaussians.bounding_box is None
+                        and iteration >= sky_prune_warmup_iter
+                    )
                     densify_info = gaussians.densify_and_prune(
                         args.opt, 0.005, size_threshold,
                         sensor_centers=sensor_centers,
                         min_range_prune=getattr(args.opt, "min_range_prune", 0.0),
                         skip_densify=not under_cap,
+                        sky_prune_enabled=asset_sky_prune_enabled,
+                        sky_view_consistency_threshold=sky_view_consistency,
+                        sky_prune_min_views=sky_min_views,
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
                     prune_scale_num += densify_info[2]
                     prune_opacity_num += densify_info[3]
+                    prune_sky_num += densify_info[4]
 
                 if iteration % args.opt.opacity_reset_interval == 0 or (
                     args.model.white_background
@@ -373,4 +405,4 @@ class SceneLidar(Scene):
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
-        return clone_num, split_num, prune_scale_num, prune_opacity_num
+        return clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num

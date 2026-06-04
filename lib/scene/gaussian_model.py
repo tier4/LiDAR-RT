@@ -44,6 +44,13 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        # Sky-mask hard-prune stats. sky_view_count counts views where this
+        # Gaussian's contribution was concentrated in sky pixels; view_count
+        # counts views where it was observed contributing meaningfully. Both
+        # accumulate between densify_and_prune calls and are reset after a
+        # prune cycle. See add_sky_stats / prune_sky_mask in densify_and_prune.
+        self.sky_view_count = torch.empty(0)
+        self.view_count = torch.empty(0)
         self.optimizer = None
         self.densify_scale_threshold = 0
         self.spatial_lr_scale = 0
@@ -188,6 +195,9 @@ class GaussianModel:
         self.densify_weight_threshold = training_args.densify_weight_threshold
         self.xyz_gradient_accum = torch.zeros((self.get_local_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_local_xyz.shape[0], 1), device="cuda")
+        n = self.get_local_xyz.shape[0]
+        self.sky_view_count = torch.zeros((n, 1), device="cuda")
+        self.view_count = torch.zeros((n, 1), device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -265,6 +275,9 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.sky_view_count.numel() > 0:
+            self.sky_view_count = self.sky_view_count[valid_points_mask]
+            self.view_count = self.view_count[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -307,6 +320,17 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_local_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_local_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_local_xyz.shape[0]), device="cuda")
+        # Append zeros for the new Gaussians so the existing entries' sky stats
+        # survive the densify step — densify_and_prune snapshots these before
+        # clone/split and uses the snapshot to compute the sky-prune mask.
+        num_new = new_xyz.shape[0]
+        if self.sky_view_count.numel() > 0 and num_new > 0:
+            self.sky_view_count = torch.cat(
+                [self.sky_view_count, torch.zeros((num_new, 1), device="cuda")], dim=0
+            )
+            self.view_count = torch.cat(
+                [self.view_count, torch.zeros((num_new, 1), device="cuda")], dim=0
+            )
 
     def densify_and_split(self, grads, grad_threshold, N=2):
         n_init_points = self.get_local_xyz.shape[0]
@@ -355,7 +379,10 @@ class GaussianModel:
 
     def densify_and_prune(self, opt, min_opacity, max_screen_size,
                           sensor_centers=None, min_range_prune=0.0,
-                          skip_densify=False):
+                          skip_densify=False,
+                          sky_prune_enabled=False,
+                          sky_view_consistency_threshold=0.8,
+                          sky_prune_min_views=3):
         # When skip_densify is True, we run only the pruning steps below
         # (low-opacity, bbox-escape, min_range_prune, big-points). This lets
         # us keep cleaning up after an asset has hit its point cap, instead
@@ -449,15 +476,65 @@ class GaussianModel:
 
                     print(f'Prune points outside bbox: {points_outside_box.sum()}')
     
+        # Sky-mask hard prune.
+        # Gaussians whose ratio of (#views judged sky)/(#views observed) exceeds
+        # sky_view_consistency_threshold, after being observed in at least
+        # sky_prune_min_views views, are removed outright. This is the safety
+        # net for sky phantoms that the depth/free-space losses fail to thin
+        # out — those losses only push opacity down, and a Gaussian with
+        # opacity still above thresh_opa_prune survives indefinitely. The
+        # multi-view consistency requirement guards against sky-mask false
+        # positives (boundary pixels, thin structures misclassified as sky).
+        prune_sky_num = 0
+        if (sky_prune_enabled and self.view_count.numel() > 0
+                and self.get_local_xyz.shape[0] > 0):
+            vc = self.view_count.squeeze(-1)
+            svc = self.sky_view_count.squeeze(-1)
+            enough_views = vc >= sky_prune_min_views
+            sky_ratio = svc / vc.clamp_min(1.0)
+            mostly_sky = sky_ratio > sky_view_consistency_threshold
+            sky_prune_mask = enough_views & mostly_sky
+            prune_sky_num = sky_prune_mask.sum().item()
+            if prune_sky_num > 0:
+                prune_mask = torch.logical_or(prune_mask, sky_prune_mask)
+                print(f'Hard prune sky-mask phantoms: {prune_sky_num}')
+
         if prune_mask.sum() < self.get_local_xyz.shape[0]:
             self.prune_points(prune_mask)
 
+        # Reset sky stats so the next densify cycle starts from a clean slate.
+        # We deliberately reset AFTER prune_points so the filter doesn't bypass
+        # the sky judgement above.
+        if self.view_count.numel() > 0:
+            self.sky_view_count.zero_()
+            self.view_count.zero_()
+
         torch.cuda.empty_cache()
-        return clone_num, split_num, prune_scale_num, prune_opacity_num
+        return clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num
 
     def add_densification_stats(self, mean_grads, update_filter):
         self.xyz_gradient_accum += torch.norm(mean_grads, dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def add_sky_stats(self, total_weight, sky_weight,
+                      min_total_contrib=1e-3, sky_ratio_threshold=0.8):
+        # Per-view sky judgement. total_weight and sky_weight are (P,) tensors
+        # from the rasterizer: sum over rendered pixels of alpha*T (total) and
+        # alpha*T*sky_mask (sky). A Gaussian is "observed" in this view when
+        # its total contribution exceeds min_total_contrib (filters out
+        # Gaussians outside the rendered area or completely occluded), and
+        # "judged sky" when its sky/total ratio exceeds sky_ratio_threshold.
+        if self.view_count.numel() == 0:
+            return
+        tw = total_weight.view(-1)
+        sw = sky_weight.view(-1)
+        observed = tw > min_total_contrib
+        if not observed.any():
+            return
+        ratio = sw / tw.clamp_min(1e-12)
+        sky_judged = observed & (ratio > sky_ratio_threshold)
+        self.view_count[observed, 0] += 1
+        self.sky_view_count[sky_judged, 0] += 1
 
     # Refer to Street Gaussian by Yan et al. in 2024.
     def box_reg_loss(self):
