@@ -1,0 +1,69 @@
+# Wandb sweep config for 20K-iteration hyperparameter search on the default
+# T4 dataset. Tunes the 3D occupancy loss (lambda / voxel size / warmup) plus
+# the two cooperating phantom losses (sky transparency, free-space). Other
+# params (depth/intensity/raydrop weights, densification schedule) stay at
+# the values in configs/t4/exp_t4.yaml so the sweep isolates the
+# anti-phantom signal.
+#
+# Usage (from repo root):
+#   wandb sweep --project LiDAR-RT-debug --entity advanced-technology-department configs/sweep_t4_20k.yaml
+#   wandb agent <entity>/<project>/<SWEEP_ID>     # paste the ID printed above
+#
+# Or via the launcher: ./run_sweep_t4.sh --create / ./run_sweep_t4.sh <SWEEP_ID>
+#
+# Each run uses --disable_refine to skip the post-training UNet stage
+# (≈30 min / run that contributes nothing to the metric we tune for here).
+
+program: train.py
+method: bayes
+metric:
+  name: eval/mix_metric    # PSNR_depth + PSNR_intensity averaged over eval frames
+  goal: maximize
+
+# Cap the agent so a runaway sweep doesn't burn the GPU forever. Override
+# with `--count` to wandb agent if you want more/fewer.
+run_cap: 30
+
+# `${args}` appends each sampled hyperparameter as `--key=value`.
+command:
+  - ${env}
+  - python
+  - ${program}
+  - -ec
+  - configs/t4/exp_t4.yaml
+  - -dc
+  - configs/t4/dynamic/example.yaml
+  - -s
+  - /home/masaya/.webauto/data/data/annotation_dataset/433a2328-a5a6-4790-87d3-59e930ac7020/2
+  - --iterations=20000
+  - --disable_refine
+  - ${args}
+
+parameters:
+  # Occupancy loss — primary focus of this sweep.
+  lambda_occupancy:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.5
+  occupancy_voxel_size:
+    values: [0.3, 0.5, 0.7, 1.0]
+  occupancy_warmup_iter:
+    values: [1000, 3000, 5000, 10000]
+
+  # Co-tuned with occupancy because all three target the same phantom-Gaussian
+  # failure mode; their best joint point likely shifts when one of them moves.
+  lambda_freespace:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.2
+  lambda_sky:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 0.1
+
+# Bayesian sweeps prune unpromising runs early when early_terminate is set.
+# Hyperband over the eval/mix_metric ramp (12K → 20K, logged each 1K iter).
+early_terminate:
+  type: hyperband
+  min_iter: 14000     # don't kill before two eval points are in
+  eta: 2

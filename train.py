@@ -1044,6 +1044,19 @@ if __name__ == "__main__":
         default=None,
         help="CUDA device ID to use (e.g. 0, 1). Defaults to current device.",
     )
+    # Wandb-sweep / quick-experiment overrides. Each one falls back to the
+    # config value when not passed, so manual runs are unaffected.
+    parser.add_argument("--iterations", type=int, default=None,
+                        help="Override args.opt.iterations (e.g. 20000 for short sweeps)")
+    parser.add_argument("--disable_refine", action="store_true",
+                        help="Skip the post-training refinement stage")
+    parser.add_argument("--lambda_occupancy", type=float, default=None)
+    parser.add_argument("--occupancy_voxel_size", type=float, default=None)
+    parser.add_argument("--occupancy_warmup_iter", type=int, default=None)
+    parser.add_argument("--lambda_freespace", type=float, default=None)
+    parser.add_argument("--lambda_sky", type=float, default=None)
+    parser.add_argument("--exp_suffix", type=str, default="",
+                        help="Append to exp_name (use to keep sweep run dirs distinct)")
     launch_args = parser.parse_args()
 
     args = parse(launch_args.exp_config_path)
@@ -1052,6 +1065,34 @@ if __name__ == "__main__":
     args.only_refine = launch_args.only_refine
     if launch_args.source_dir:
         args.source_dir = launch_args.source_dir
+
+    # CLI overrides — apply BEFORE wandb.init so the logged config reflects
+    # the actual values used for training (these end up in wandb run metadata).
+    opt_overrides = {
+        "lambda_occupancy": launch_args.lambda_occupancy,
+        "occupancy_voxel_size": launch_args.occupancy_voxel_size,
+        "occupancy_warmup_iter": launch_args.occupancy_warmup_iter,
+        "lambda_freespace": launch_args.lambda_freespace,
+        "lambda_sky": launch_args.lambda_sky,
+    }
+    for k, v in opt_overrides.items():
+        if v is not None:
+            setattr(args.opt, k, v)
+            print(f"[override] args.opt.{k} = {v}")
+    if launch_args.iterations is not None:
+        args.opt.iterations = launch_args.iterations
+        # position_lr_max_steps controls the cosine schedule and is normally
+        # tied to iterations; keep them in lockstep so a short sweep doesn't
+        # leave the xyz LR stuck at the start of the ramp.
+        args.opt.position_lr_max_steps = launch_args.iterations
+        print(f"[override] args.opt.iterations = {launch_args.iterations}  "
+              f"(position_lr_max_steps tracked)")
+    if launch_args.disable_refine:
+        args.refine.use_refine = False
+        print("[override] args.refine.use_refine = False")
+    if launch_args.exp_suffix:
+        args.exp_name = f"{args.exp_name}_{launch_args.exp_suffix}"
+        print(f"[override] args.exp_name = {args.exp_name}")
 
     if launch_args.gpu is not None:
         if not torch.cuda.is_available():
