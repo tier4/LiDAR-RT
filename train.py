@@ -608,6 +608,54 @@ def training(args):
                         ),
                     }, step=iteration)
 
+                # === Intensity comparison (same viz_frame, same sensor) ===
+                # Mirrors the depth panel: top=GT, mid=rendered, bot=|err|.
+                # Intensity is already in [0, 1] so no log scaling is applied;
+                # error colormap uses the 99th percentile for robustness to
+                # outlier pixels, like the depth one.
+                gt_intensity_viz = scene.train_lidar.get_intensity(viz_frame).cuda()
+                gt_intensity_np = gt_intensity_viz.detach().cpu().numpy()
+                rendered_intensity_2d = rendered_intensity.squeeze(-1).detach().cpu().numpy()
+
+                gt_intensity_img = colorize_intensity(gt_intensity_np, mask=gt_mask_np)
+                pred_intensity_img = colorize_intensity(rendered_intensity_2d, mask=pred_hit_any)
+
+                int_err_valid = gt_mask_np & pred_hit_any
+                int_err_map = np.zeros_like(gt_intensity_np, dtype=np.float32)
+                int_err_map[int_err_valid] = np.abs(
+                    gt_intensity_np[int_err_valid] - rendered_intensity_2d[int_err_valid]
+                )
+                if int_err_valid.any():
+                    int_err_cap = float(np.quantile(int_err_map[int_err_valid], 0.99))
+                else:
+                    int_err_cap = 1.0
+                int_err_cap = max(int_err_cap, 1e-3)
+                # colorize_depth normalises to [vmin, vmax] linearly which is
+                # exactly the behaviour we want for the intensity error map.
+                int_error_img = colorize_depth(int_err_map, 0.0, int_err_cap,
+                                               mask=int_err_valid)
+
+                intensity_concat = np.concatenate(
+                    [gt_intensity_img, pred_intensity_img, int_error_img], axis=0
+                )
+                cv2.imwrite(
+                    os.path.join(output_dir, "images",
+                                 str(iteration) + "_intensity.png"),
+                    intensity_concat,
+                )
+
+                if WANDB_FOUND:
+                    wandb.log({
+                        "viz/intensity_compare": wandb.Image(
+                            cv2.cvtColor(intensity_concat, cv2.COLOR_BGR2RGB),
+                            caption=(
+                                f"iter {iteration} | frame {viz_frame} | top→bot: "
+                                f"intensity_gt / intensity_rendered / |error| "
+                                f"(cap={int_err_cap:.3f})"
+                            ),
+                        ),
+                    }, step=iteration)
+
             # Progress bar
             ema_loss_for_log = 0.4 * loss + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
