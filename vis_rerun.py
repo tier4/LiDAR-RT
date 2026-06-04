@@ -174,6 +174,21 @@ def depth_to_colors(depth, vmin=0.0, vmax=120.0):
     return colors.reshape(-1, 3)[:, ::-1].copy()  # BGR -> RGB
 
 
+def intensity_to_point_colors(intensity_1d, fade=0.0):
+    """Map (N,) intensity in [0, 1] to (N, 3) RGB uint8 via the JET colormap.
+
+    fade in [0, 1] blends the result toward pure white so the same colormap
+    can be reused with different visual weights — used to render the GT cloud
+    as a pale wash and the rendered cloud at full saturation in the same scene.
+    """
+    norm = (np.clip(intensity_1d, 0.0, 1.0) * 255).astype(np.uint8).reshape(-1, 1)
+    bgr = cv2.applyColorMap(norm, cv2.COLORMAP_JET).reshape(-1, 3)
+    rgb = bgr[:, ::-1].astype(np.float32)
+    if fade > 0:
+        rgb = rgb * (1.0 - fade) + 255.0 * fade
+    return rgb.astype(np.uint8)
+
+
 def main():
     args = build_args()
     data_type = getattr(args, "data_type", "unknown")
@@ -370,11 +385,22 @@ def main():
             gt_pts = gt_all_pts[gt_mask_2d] - origin_offset
             rendered_pts = rd_all_pts[rd_mask_2d] - origin_offset
 
+            # Per-point intensity colors. Both clouds use the same JET ramp on
+            # the [0, 1] intensity range, but GT is heavily faded toward white
+            # while rendered stays saturated — same colormap, different visual
+            # weight, so the two clouds remain distinguishable when overlaid
+            # in the 3D view. `sensor_color` is intentionally not used here:
+            # the per-sensor entity paths still keep them toggleable.
+            gt_int_vals = gt_intensity_np.squeeze(-1)[gt_mask_2d]
+            rd_int_vals = rendered_intensity_np.squeeze(-1)[rd_mask_2d]
+            gt_colors = intensity_to_point_colors(gt_int_vals, fade=0.65)
+            rd_colors = intensity_to_point_colors(rd_int_vals, fade=0.0)
+
             # Per-sensor 3D points
             rr.log(f"world/pointcloud/gt/{sensor_name}",
-                    rr.Points3D(gt_pts, colors=[sensor_color] * len(gt_pts), radii=0.05))
+                    rr.Points3D(gt_pts, colors=gt_colors, radii=0.05))
             rr.log(f"world/pointcloud/rendered/{sensor_name}",
-                    rr.Points3D(rendered_pts, colors=[[0, 255, 0]] * len(rendered_pts), radii=0.05))
+                    rr.Points3D(rendered_pts, colors=rd_colors, radii=0.05))
 
             # Range images. Same masks/colormap as the wandb visualization in
             # train.py: GT uses gt_mask, pred uses depth>0 (any Gaussian hit).
