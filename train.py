@@ -577,9 +577,14 @@ def training(args):
                 # full-asset panel are coming from bg phantoms or genuine
                 # tracked-object Gaussians.
                 if len(gaussians_assets) > 1:
+                    # raytracing's default branch assumes >=1 object asset and
+                    # crashes on torch.cat(obj_rot[1:]) when given a bg-only
+                    # list. Use decomp="background" so the renderer takes its
+                    # bg-only code path (gaussian_assets[:1] + rot_in_local[0]
+                    # only, no object concat).
                     bg_render_pkg = raytracing(
-                        viz_frame, [gaussians_assets[0]], scene.train_lidar,
-                        background, args,
+                        viz_frame, gaussians_assets, scene.train_lidar,
+                        background, args, decomp="background",
                     )
                     bg_depth_2d = bg_render_pkg["depth"].squeeze(-1).detach().cpu().numpy()
                 else:
