@@ -124,6 +124,9 @@ def training(args):
             "lambda_reg": getattr(args.opt, "lambda_reg", None),
             "lambda_sky": getattr(args.opt, "lambda_sky", None),
             "lambda_freespace": getattr(args.opt, "lambda_freespace", None),
+            "lambda_occupancy": getattr(args.opt, "lambda_occupancy", None),
+            "occupancy_voxel_size": getattr(args.opt, "occupancy_voxel_size", None),
+            "occupancy_warmup_iter": getattr(args.opt, "occupancy_warmup_iter", None),
             "min_range_prune": getattr(args.opt, "min_range_prune", None),
             "max_depth": getattr(args, "max_depth", None),
             "densify_until_iter": getattr(args.opt, "densify_until_iter", None),
@@ -162,6 +165,22 @@ def training(args):
         initial=first_iter, total=args.opt.iterations, desc="Training progress"
     )
     first_iter += 1
+
+    # Build a one-shot world-frame occupancy grid from training LiDAR points
+    # with dynamic-bbox interiors removed. Used downstream to penalise the
+    # opacity of bg Gaussians that sit in voxels no LiDAR return ever fell
+    # into — a structural anti-phantom signal independent of sky masks.
+    lambda_occupancy = float(getattr(args.opt, "lambda_occupancy", 0.0))
+    occupancy_warmup_iter = int(getattr(args.opt, "occupancy_warmup_iter", 0))
+    occupancy_grid = None
+    if lambda_occupancy > 0:
+        from lib.scene.occupancy_grid import WorldOccupancyGrid
+        occ_voxel_size = float(getattr(args.opt, "occupancy_voxel_size", 0.5))
+        occupancy_grid = WorldOccupancyGrid(voxel_size=occ_voxel_size)
+        stats = occupancy_grid.build(scene.train_lidars, gaussians_assets[1:])
+        print(f"[Occupancy] voxel_size={stats['voxel_size']}  "
+              f"frames={stats['n_frames']}  points={stats['n_points']}  "
+              f"occupied_voxels={stats['n_voxels']}")
 
     end = time.time()
     frame_s, frame_e = args.frame_length[0], args.frame_length[1]
@@ -325,7 +344,28 @@ def training(args):
         else:
             loss_freespace = torch.tensor(0.0, device="cuda")
 
-        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace
+        # === 3D occupancy loss ===
+        # Penalises the opacity of background Gaussians whose centres sit in
+        # voxels no training LiDAR return ever fell into (dynamic-bbox
+        # interiors excluded at grid build time). Operates only on the bg
+        # asset — object Gaussians live inside their bboxes whose interiors
+        # were stripped from the grid, so every object Gaussian would
+        # otherwise be falsely judged free. Per-phantom mean keeps the
+        # gradient magnitude scene-invariant, matching the sky/free-space
+        # loss pattern.
+        if (lambda_occupancy > 0 and occupancy_grid is not None
+                and iteration >= occupancy_warmup_iter):
+            bg_gs = gaussians_assets[0]
+            bg_xyz_world = bg_gs.get_world_xyz()  # bg has bounding_box=None → just _xyz
+            is_free = occupancy_grid.free_mask(bg_xyz_world)
+            if is_free.any():
+                loss_occupancy = lambda_occupancy * bg_gs.get_opacity[is_free].mean()
+            else:
+                loss_occupancy = torch.tensor(0.0, device="cuda")
+        else:
+            loss_occupancy = torch.tensor(0.0, device="cuda")
+
+        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace + loss_occupancy
 
         # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
         if not torch.isfinite(loss):
@@ -464,6 +504,8 @@ def training(args):
                         "train/sky_loss": loss_sky.item(),
                         # Free-space supervision
                         "train/freespace_loss": loss_freespace.item(),
+                        # 3D occupancy supervision
+                        "train/occupancy_loss": loss_occupancy.item(),
                         # Densification
                         "train/points_num": points_num,
                         "train/clone_sum": clone_sum,
