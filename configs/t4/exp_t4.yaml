@@ -32,6 +32,9 @@ opt:
   densify_weight_threshold: 0.0
   prune_size_threshold: 0.1
   thresh_opa_prune: 0.001
+  min_scale: 1.0e-6   # Lower bound on σ=exp(_scaling) applied every Adam step;
+                      # prevents OptiX EXCESSIVE_DEGENERATE_PRIMITIVES warnings
+                      # caused by post-densify scale drift. 0 disables.
 
   lambda_normal: 0.00
   lambda_cd: 0.01

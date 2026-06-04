@@ -804,6 +804,41 @@ def training(args):
 
         iter_end.record()
 
+    # Final degenerate-Gaussian cleanup. After densify_until_iter the
+    # densify-time prune stops running, but Adam keeps updating _scaling and
+    # _opacity, so by the end of training the assets accumulate Gaussians
+    # whose σ has collapsed below 1e-6 or whose opacity sits below
+    # thresh_opa_prune. OptiX flags those as degenerate primitives during the
+    # final-sweep BVH build (EXCESSIVE_DEGENERATE_PRIMITIVES warning with
+    # percentage: .inf). Strip them here so any downstream raytracing pass
+    # (sky-prune sweep, viz, refine) sees a clean asset list.
+    if not args.only_refine:
+        cleanup_min_scale = float(getattr(args.opt, "min_scale", 1e-6))
+        cleanup_opacity = float(getattr(args.opt, "thresh_opa_prune", 0.001))
+        total_cleaned = 0
+        for i, gs in enumerate(gaussians_assets):
+            n_before = gs.get_local_xyz.shape[0]
+            if n_before == 0:
+                continue
+            sigma = torch.exp(gs._scaling.detach())
+            bad_scale = (sigma < cleanup_min_scale).any(dim=-1)
+            opa = torch.sigmoid(gs._opacity.detach()).view(-1)
+            bad_opa = opa < cleanup_opacity
+            bad = bad_scale | bad_opa
+            n_bad = int(bad.sum().item())
+            if 0 < n_bad < n_before:
+                gs.prune_points(bad)
+                total_cleaned += n_bad
+                print(f"  [Final cleanup] asset[{i}]: "
+                      f"bad_scale={int(bad_scale.sum().item())} "
+                      f"bad_opacity={int(bad_opa.sum().item())} "
+                      f"pruned={n_bad}/{n_before}")
+        print(f"[Final cleanup] total pruned (degenerate scale / "
+              f"opacity<{cleanup_opacity}): {total_cleaned}")
+        if WANDB_FOUND and total_cleaned > 0:
+            wandb.log({"train/final_cleanup_total": total_cleaned},
+                      step=args.opt.iterations)
+
     # Final sky-mask hard prune: deterministic full-view sweep over every
     # training (sensor, frame), then prune background Gaussians whose
     # sky-pixel contribution concentrates across enough views. Catches any

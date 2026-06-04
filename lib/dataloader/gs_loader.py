@@ -1,3 +1,4 @@
+import math
 import os
 import random
 from typing import Dict
@@ -404,5 +405,17 @@ class SceneLidar(Scene):
             if iteration < args.opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
+
+                # Floor _scaling so Adam can't drive σ = exp(_scaling) below the
+                # OptiX degenerate-primitive threshold (~1e-8). Without this,
+                # post-densify_until_iter the scale parameter drifts negative
+                # unchecked — we observed 37% of all Gaussians collapsed to
+                # σ < 1e-4 by iter 30000, triggering the BVH builder's
+                # EXCESSIVE_DEGENERATE_PRIMITIVES warning. A 1e-6 floor stays
+                # well below any structural surfel size while keeping the BVH
+                # well-formed. Configurable via opt.min_scale (linear metres).
+                min_scale = float(getattr(args.opt, "min_scale", 1e-6))
+                if min_scale > 0:
+                    gaussians._scaling.data.clamp_(min=math.log(min_scale))
 
         return clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num
