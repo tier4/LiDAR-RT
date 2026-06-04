@@ -50,11 +50,27 @@ def colorize_depth(depth_np, vmin, vmax, mask=None, log_scale=False):
     return img
 
 
-def colorize_intensity(intensity_np, mask=None):
-    """Colorize an intensity map (0-1) with cv2 JET colormap. Returns BGR uint8."""
+def colorize_intensity(intensity_np, mask=None,
+                       vmin=0.0, vmax=1.0, log_scale=False):
+    """Colorize an intensity map with cv2 JET colormap. Returns BGR uint8.
+
+    Defaults (vmin=0, vmax=1, log_scale=False) preserve the original
+    behaviour of treating the input as already normalised. For raw LiDAR
+    uint8 intensity (T4: p99 ≈ 64, retroreflectors at 255), pass
+    vmin=0, vmax=64, log_scale=True to match the rerun 3D point-cloud
+    ramp — log spreads the visible spectrum across the dense low-
+    intensity band where ~99% of points live.
+    """
     if intensity_np.ndim == 3 and intensity_np.shape[-1] == 1:
         intensity_np = intensity_np.squeeze(-1)
-    norm = np.clip(intensity_np, 0.0, 1.0)
+    if log_scale:
+        v = np.log1p(np.maximum(intensity_np, 0.0))
+        lo = np.log1p(max(vmin, 0.0))
+        hi = np.log1p(max(vmax, vmin + 1e-3))
+    else:
+        v = intensity_np
+        lo, hi = float(vmin), float(vmax)
+    norm = np.clip((v - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
     img = cv2.applyColorMap(np.uint8(norm * 255), cv2.COLORMAP_JET)
     if mask is not None:
         if mask.ndim == 3 and mask.shape[-1] == 1:

@@ -655,15 +655,26 @@ def training(args):
 
                 # === Intensity comparison (same viz_frame, same sensor) ===
                 # Mirrors the depth panel: top=GT, mid=rendered, bot=|err|.
-                # Intensity is already in [0, 1] so no log scaling is applied;
-                # error colormap uses the 99th percentile for robustness to
-                # outlier pixels, like the depth one.
+                # T4 LiDAR stores raw uint8 intensity (p50≈12, p99≈64,
+                # retroreflectors at 255), so we use the same log-ramp
+                # [0, 64] colormap as the rerun 3D point cloud — keeps the
+                # wandb 2D panel visually aligned with whatever the user
+                # sees in rerun. GT and Render are colorised with the same
+                # parameters (no fading) so the only visible difference
+                # between the two rows is the actual reconstruction error.
                 gt_intensity_viz = scene.train_lidar.get_intensity(viz_frame).cuda()
                 gt_intensity_np = gt_intensity_viz.detach().cpu().numpy()
                 rendered_intensity_2d = rendered_intensity.squeeze(-1).detach().cpu().numpy()
 
-                gt_intensity_img = colorize_intensity(gt_intensity_np, mask=gt_mask_np)
-                pred_intensity_img = colorize_intensity(rendered_intensity_2d, mask=pred_hit_any)
+                int_vmin, int_vmax = 0.0, 64.0
+                gt_intensity_img = colorize_intensity(
+                    gt_intensity_np, mask=gt_mask_np,
+                    vmin=int_vmin, vmax=int_vmax, log_scale=True,
+                )
+                pred_intensity_img = colorize_intensity(
+                    rendered_intensity_2d, mask=pred_hit_any,
+                    vmin=int_vmin, vmax=int_vmax, log_scale=True,
+                )
 
                 int_err_valid = gt_mask_np & pred_hit_any
                 int_err_map = np.zeros_like(gt_intensity_np, dtype=np.float32)
