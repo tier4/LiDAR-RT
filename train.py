@@ -619,7 +619,7 @@ def training(args):
 
                 if WANDB_FOUND:
                     # cv2 returns BGR; wandb expects RGB
-                    wandb.log({
+                    log_payload = {
                         "viz/depth_compare": wandb.Image(
                             cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB),
                             caption=(
@@ -628,7 +628,25 @@ def training(args):
                                 f"error (cap={err_cap:.2f}m)"
                             ),
                         ),
-                    }, step=iteration)
+                    }
+                    # Depth-error histogram over pixels where BOTH GT and the
+                    # rendered image have a return (err_valid). Fixed bins so
+                    # the distribution is comparable across iterations: 50 bins
+                    # spanning 0-50 m (1 m each). Pixels with no-return on
+                    # either side are excluded by construction (err_valid).
+                    if err_valid.any():
+                        err_vals = err_map[err_valid].astype(np.float32)
+                        # Clip into the last bin instead of dropping outliers:
+                        # a tall right-most bar tells you "X pixels had error
+                        # >= 50 m" rather than silently shrinking the
+                        # distribution.
+                        bin_edges = np.linspace(0.0, 50.0, 51, dtype=np.float32)
+                        err_vals = np.minimum(err_vals, bin_edges[-1] - 1e-3)
+                        counts, _ = np.histogram(err_vals, bins=bin_edges)
+                        log_payload["viz/depth_error_hist"] = wandb.Histogram(
+                            np_histogram=(counts, bin_edges)
+                        )
+                    wandb.log(log_payload, step=iteration)
 
                 # === Intensity comparison (same viz_frame, same sensor) ===
                 # Mirrors the depth panel: top=GT, mid=rendered, bot=|err|.
