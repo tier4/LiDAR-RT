@@ -401,7 +401,10 @@ class GaussianModel:
                           aniso_prune_max_opacity=0.5,
                           front_prune_enabled=False,
                           front_view_consistency_threshold=0.8,
-                          front_prune_min_views=3):
+                          front_prune_min_views=3,
+                          occupancy_grid=None,
+                          occupancy_prune_enabled=False,
+                          occupancy_prune_opacity_threshold=0.5):
         # When skip_densify is True, we run only the pruning steps below
         # (low-opacity, bbox-escape, min_range_prune, big-points). This lets
         # us keep cleaning up after an asset has hit its point cap, instead
@@ -422,6 +425,7 @@ class GaussianModel:
         prune_scale_num = 0
         prune_aniso_num = 0
         prune_front_num = 0
+        prune_occ_num = 0
 
         # Anisotropy hard prune (bg only). T4's Hesai OT128 packs beams near
         # the horizon, and Tokyo urban scenes have building edges crossing
@@ -565,6 +569,31 @@ class GaussianModel:
                 prune_mask = torch.logical_or(prune_mask, front_prune_mask)
                 print(f'Hard prune front-of-GT phantoms: {prune_front_num}')
 
+        # Occupancy hard prune (bg only). The voxel-based loss_occupancy is a
+        # soft per-Gaussian-mean push that hovers at equilibrium even when
+        # actual phantoms are removed (mean stays high because pruning catches
+        # only specific subsets — sky_prune / front_prune / opacity_prune all
+        # miss out-of-LiDAR-FOV Gaussians that drift to high opacity unchecked).
+        # This block closes the gap: any bg Gaussian whose world-frame centre
+        # lands in a free voxel AND whose opacity exceeds threshold is
+        # definitionally a phantom (LiDAR never returned there yet it's
+        # rendering visibly), hard-prune outright. Low-opacity free-voxel
+        # Gaussians are left for opacity_prune to handle — they may still
+        # represent borderline learning candidates.
+        if (occupancy_prune_enabled and self.bounding_box is None
+                and occupancy_grid is not None
+                and self.get_local_xyz.shape[0] > 0):
+            world_xyz = self.get_world_xyz()  # bg → just _xyz
+            is_free = occupancy_grid.free_mask(world_xyz)
+            opa = self.get_opacity.squeeze(-1)
+            high_opa_in_free = is_free & (opa > occupancy_prune_opacity_threshold)
+            prune_occ_num = int(high_opa_in_free.sum().item())
+            if prune_occ_num > 0:
+                prune_mask = torch.logical_or(prune_mask, high_opa_in_free)
+                print(f'Hard prune occupancy phantoms '
+                      f'(free voxel & opa>{occupancy_prune_opacity_threshold}): '
+                      f'{prune_occ_num}')
+
         if prune_mask.sum() < self.get_local_xyz.shape[0]:
             self.prune_points(prune_mask)
 
@@ -580,7 +609,7 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
-                prune_sky_num, prune_aniso_num, prune_front_num)
+                prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num)
 
     def add_densification_stats(self, mean_grads, update_filter):
         self.xyz_gradient_accum += torch.norm(mean_grads, dim=-1, keepdim=True)

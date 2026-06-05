@@ -90,6 +90,7 @@ def training(args):
         "prune_sky_sum": [],
         "prune_aniso_sum": [],
         "prune_front_sum": [],
+        "prune_occ_sum": [],
     }
     scene_id = str(args.scene_id) if isinstance(args.scene_id, int) else args.scene_id
     output_dir = os.path.join(
@@ -437,6 +438,7 @@ def training(args):
                 args, iteration, means3d.grad, acc_wet, None, None,
                 sky_weights=acc_sky_wet,
                 front_weights=acc_front_wet,
+                occupancy_grid=occupancy_grid,
             )
 
             points_num = 0
@@ -480,6 +482,11 @@ def training(args):
                 if log.get("prune_front_sum")
                 else densify_info[6]
             )
+            prune_occ_sum = (
+                densify_info[7] + log["prune_occ_sum"][-1]
+                if log.get("prune_occ_sum")
+                else densify_info[7]
+            )
             log["depth_mse"].append(depth_mse)
             log["points_num"].append(points_num)
             log["clone_sum"].append(clone_sum)
@@ -489,6 +496,7 @@ def training(args):
             log.setdefault("prune_sky_sum", []).append(prune_sky_sum)
             log.setdefault("prune_aniso_sum", []).append(prune_aniso_sum)
             log.setdefault("prune_front_sum", []).append(prune_front_sum)
+            log.setdefault("prune_occ_sum", []).append(prune_occ_sum)
 
             # prepare loss stats for tensorboard record
             loss_stats = {
@@ -580,6 +588,7 @@ def training(args):
                         "train/prune_sky_sum": prune_sky_sum,
                         "train/prune_aniso_sum": prune_aniso_sum,
                         "train/prune_front_sum": prune_front_sum,
+                        "train/prune_occ_sum": prune_occ_sum,
                         # Learning rate
                         "train/lr_xyz": gaussians_assets[0].optimizer.param_groups[0]["lr"],
                     },

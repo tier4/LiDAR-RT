@@ -57,8 +57,20 @@ opt:
                           # Front-side accumulation loss: directly attacks horizon-ring phantoms
                           # on hit rays that the sky-only freespace loss cannot see.
   lambda_occupancy: 0.05  # Penalise opacity of bg Gaussians sitting in voxels no LiDAR return ever hit
-  occupancy_voxel_size: 0.5    # World-frame voxel size (m) for the occupancy grid
+  occupancy_voxel_size: 0.1    # World-frame voxel size (m) for the occupancy grid
   occupancy_warmup_iter: 3000  # Gate the loss until densification has settled
+
+  # Occupancy hard prune (bg only). The soft loss_occupancy is a
+  # per-Gaussian-mean push that hovers at equilibrium because none of the
+  # other prune mechanisms (sky / front / opacity) catches out-of-LiDAR-FOV
+  # high-opacity Gaussians in free voxels. This hard-prunes any bg
+  # Gaussian whose world-frame centre lands in a free voxel AND whose
+  # opacity exceeds threshold — definitionally a phantom (LiDAR never
+  # returned there, yet it's rendering visibly). Reuses the same
+  # OccupancyGrid the soft loss builds at startup.
+  occupancy_prune_enabled: true
+  occupancy_prune_warmup_iter: 3000      # gate until densification settled
+  occupancy_prune_opacity_threshold: 0.5  # opa > this & in free voxel → kill
   min_range_prune: 1.0   # Hard-prune background Gaussians within this distance from any sensor
   sky_morph_kernel: 5    # Morphological closing kernel applied to gt_mask before sky loss
                          #   (0/1 = disabled, 3 fills 1-pix holes, 5 fills 2-pix holes)

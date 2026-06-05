@@ -307,9 +307,10 @@ class SceneLidar(Scene):
         radii_list,
         sky_weights=None,
         front_weights=None,
+        occupancy_grid=None,
     ):
 
-        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num, prune_front_num = 0, 0, 0, 0, 0, 0, 0
+        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num = 0, 0, 0, 0, 0, 0, 0, 0
 
         sky_prune_enabled_global = bool(getattr(args.opt, "sky_prune_enabled", False))
         sky_prune_warmup_iter = int(getattr(args.opt, "sky_prune_warmup_iter", 0))
@@ -329,6 +330,10 @@ class SceneLidar(Scene):
         front_min_total_contrib = float(getattr(args.opt, "front_prune_min_total_contrib", 1e-3))
         front_view_consistency = float(getattr(args.opt, "front_prune_view_consistency_threshold", 0.8))
         front_min_views = int(getattr(args.opt, "front_prune_min_views", 3))
+
+        occupancy_prune_enabled_global = bool(getattr(args.opt, "occupancy_prune_enabled", False))
+        occupancy_prune_warmup_iter = int(getattr(args.opt, "occupancy_prune_warmup_iter", 0))
+        occupancy_prune_opacity_threshold = float(getattr(args.opt, "occupancy_prune_opacity_threshold", 0.5))
 
         begin_index = 0
         for gaussians in self.gaussians_assets:
@@ -423,6 +428,12 @@ class SceneLidar(Scene):
                         and gaussians.bounding_box is None
                         and iteration >= front_prune_warmup_iter
                     )
+                    asset_occupancy_prune_enabled = (
+                        occupancy_prune_enabled_global
+                        and gaussians.bounding_box is None
+                        and iteration >= occupancy_prune_warmup_iter
+                        and occupancy_grid is not None
+                    )
                     densify_info = gaussians.densify_and_prune(
                         args.opt, 0.005, size_threshold,
                         sensor_centers=sensor_centers,
@@ -437,6 +448,9 @@ class SceneLidar(Scene):
                         front_prune_enabled=asset_front_prune_enabled,
                         front_view_consistency_threshold=front_view_consistency,
                         front_prune_min_views=front_min_views,
+                        occupancy_grid=occupancy_grid if asset_occupancy_prune_enabled else None,
+                        occupancy_prune_enabled=asset_occupancy_prune_enabled,
+                        occupancy_prune_opacity_threshold=occupancy_prune_opacity_threshold,
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
@@ -445,6 +459,7 @@ class SceneLidar(Scene):
                     prune_sky_num += densify_info[4]
                     prune_aniso_num += densify_info[5]
                     prune_front_num += densify_info[6]
+                    prune_occ_num += densify_info[7]
 
                 if iteration % args.opt.opacity_reset_interval == 0 or (
                     args.model.white_background
@@ -470,4 +485,4 @@ class SceneLidar(Scene):
                     gaussians._scaling.data.clamp_(min=math.log(min_scale))
 
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
-                prune_sky_num, prune_aniso_num, prune_front_num)
+                prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num)
