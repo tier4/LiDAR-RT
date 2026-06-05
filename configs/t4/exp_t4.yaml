@@ -21,23 +21,39 @@ opt:
   position_lr_max_steps: 30_000
 
   densification_interval: 100
-  opacity_reset_interval: 6000   # Was 3000. Each reset clamps α≤0.01 so the
-                                 # next densify cycle prunes 1.5-2.7M Gaussians
-                                 # ("junk wave"). Halving the frequency cuts
-                                 # cumulative churn ~50% and lets pop stabilise.
-  densify_from_iter: 500
+  opacity_reset_interval: 999999  # Effectively disabled. Was 6000, before
+                                  # that 3000. Time-series analysis showed
+                                  # each reset (α clamped to 0.01) caused a
+                                  # 3-4M Gaussian prune wave in the next
+                                  # cycle, then 3M+ rebuild via densify —
+                                  # 30% retention overall. Disabling
+                                  # eliminates the periodic upheaval; the
+                                  # continuous opacity_prune (α<0.02) plus
+                                  # sky_prune / front_prune / occupancy_loss
+                                  # already provide enough downward pressure
+                                  # to shed junk Gaussians.
+  densify_from_iter: 1500          # Was 500. Lets the initial 1.2M
+                                   # PCD-seeded Gaussians settle their α
+                                   # before clone/split adds more candidates.
+                                   # Cuts the iter 0-1000 churn observed
+                                   # in the last run (~200K early prunes).
   densify_until_iter: 15_000
-  densify_until_num_points: 2_000_000
+  densify_until_num_points: 1_000_000  # Was 2_000_000. Per-asset cap; once
+                                       # bg reaches this, only prune fires
+                                       # (skip_densify=True). Bounds final
+                                       # population near a sustainable size.
 
   densify_use_absgrads: False
   densify_scale_threshold: 0.0002
-  densify_grad_threshold: 0.0005  # Was 0.0002. T4 urban scenes have high-
-                                  # gradient pixels everywhere (edges, horizon,
-                                  # textures); low threshold spawned ~15M
-                                  # clones/12K iter of which 90% died short.
-                                  # 2.5x reduces spurious densify; the edge-
-                                  # phantom side is now handled by stack_loss
-                                  # + front_acc rather than over-densification.
+  densify_grad_threshold: 0.001   # Was 0.0002, then 0.0005. With reset
+                                  # disabled and a 1M cap, the model needs
+                                  # to be more selective about WHICH high-
+                                  # gradient pixels actually warrant a new
+                                  # Gaussian. 2x raise from prior setting
+                                  # halves spawn rate to ~400/iter (was
+                                  # 825/iter), and combined with the cap
+                                  # gives a sustainable 2-2.5M steady-state
+                                  # population.
   densify_weight_threshold: 0.0
   prune_size_threshold: 0.1
   thresh_opa_prune: 0.02   # Was 0.001 — bg ckpt analysis showed ~55% of
