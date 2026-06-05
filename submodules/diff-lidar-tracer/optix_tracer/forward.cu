@@ -286,6 +286,17 @@ extern "C" __global__ void __raygen__ot()
                     atomicAdd(params.accum_gaussian_sky_weights + gidx, w * pw);
                 }
             }
+            // Per-Gaussian front-side accumulator: only adds w when this hit
+            // is strictly in front of the pixel's target_depth. Across many
+            // training views, a Gaussian whose front_weights / total_weights
+            // ratio stays close to 1 is a phantom sitting between sensor and
+            // the real LiDAR return — flagged for hard prune (see
+            // GaussianModel.add_front_stats + the front_prune block in
+            // densify_and_prune).
+            if (params.accum_gaussian_front_weights != nullptr
+                    && has_target && target_dpt > 0.0f && dpt < target_dpt) {
+                atomicAdd(params.accum_gaussian_front_weights + gidx, w);
+            }
 
             // Update transmittence
             T = test_T;

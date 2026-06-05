@@ -98,6 +98,20 @@ opt:
   max_aniso_prune: 10.0
   aniso_prune_max_opacity: 0.5
 
+  # Front-side multi-view hard-prune (bg only). Mirror of sky_prune but for
+  # hit rays: a Gaussian whose contribution is consistently *in front of*
+  # the GT target_depth across many views is a horizon-ring / near-range
+  # phantom. The lambda_front_acc loss alone can't always defeat
+  # opacity_reset cycles, so this provides a decisive multi-view safety
+  # net. Uses the same accum_gaussian_front_weights per-Gaussian signal
+  # the kernel records (forward.cu) for target_depth-supplied views.
+  front_prune_enabled: true
+  front_prune_warmup_iter: 3000
+  front_prune_pixel_ratio_threshold: 0.8       # per-view front/total to judge "front"
+  front_prune_min_total_contrib: 0.001          # ignore Gaussians barely contributing
+  front_prune_view_consistency_threshold: 0.8  # fraction of views that must agree
+  front_prune_min_views: 3                      # minimum #views before any decision
+
   use_rayhit: True
 
   use_normal_init: True

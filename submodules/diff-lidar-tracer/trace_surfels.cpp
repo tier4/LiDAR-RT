@@ -148,7 +148,7 @@ void BuildAccelerationStructure(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 TraceSurfelsCUDA(
     const OptiXStateWrapper& stateWrapper,
     const bool training,
@@ -215,6 +215,9 @@ TraceSurfelsCUDA(
     // Front-side per-pixel accumulator. Only meaningful when target_depth is
     // provided (non-empty); zero otherwise.
     torch::Tensor accum_at_target = torch::zeros({H, W}, float_opts);
+    // Per-Gaussian front-side accumulator. Zero unless target_depth was
+    // provided (non-empty); used by the multi-view front-side hard prune.
+    torch::Tensor accum_gaussian_front_weights = torch::zeros({P}, float_opts);
 
 
     // Create global parameters for the OptiX program
@@ -261,6 +264,11 @@ TraceSurfelsCUDA(
     params.target_depth = target_depth.numel() > 0 ? target_depth.contiguous().data_ptr<float>() : nullptr;
     params.accum_at_target = accum_at_target.contiguous().data_ptr<float>();
     params.dL_daccum_at_target = nullptr;  // unused in forward
+    // Per-Gaussian front-side accumulator (only active when target_depth was
+    // provided; otherwise the atomicAdd path is gated off by target_depth==nullptr).
+    params.accum_gaussian_front_weights = target_depth.numel() > 0
+        ? accum_gaussian_front_weights.contiguous().data_ptr<float>()
+        : nullptr;
 
 
     // Allocate memory for the parameters
@@ -278,9 +286,10 @@ TraceSurfelsCUDA(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Return
-    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
         out_attr_float32, out_attr_uint32, accum_gaussian_weights,
-        accum_gaussian_sky_weights, accum_at_target);
+        accum_gaussian_sky_weights, accum_at_target,
+        accum_gaussian_front_weights);
 }
 
 
@@ -384,6 +393,7 @@ TraceSurfelsBackwardCUDA(
     params.target_depth = target_depth.numel() > 0 ? target_depth.contiguous().data_ptr<float>() : nullptr;
     params.accum_at_target = accum_at_target.numel() > 0 ? accum_at_target.contiguous().data_ptr<float>() : nullptr;
     params.dL_daccum_at_target = dL_daccum_at_target.numel() > 0 ? dL_daccum_at_target.contiguous().data_ptr<float>() : nullptr;
+    params.accum_gaussian_front_weights = nullptr;  // forward-only path
     // Store output gradients
     params.dL_dmeans3D = reinterpret_cast<glm::vec3*>(dL_dmeans3D.contiguous().data_ptr<float>());
     params.dL_dgrads3D_abs = reinterpret_cast<glm::vec3*>(dL_dgrads3D_abs.contiguous().data_ptr<float>());

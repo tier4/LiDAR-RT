@@ -85,6 +85,15 @@ struct Params
     // Backward-side gradient (filled by autograd, read by backward.cu).
     float* dL_daccum_at_target;   // (H, W)
 
+    // Per-Gaussian front-side accumulator (P,). Atomic-added in forward when
+    // a hit's dpt is strictly less than the pixel's target_depth. Combined
+    // with accum_gaussian_weights (total contribution regardless of depth),
+    // the ratio accum_gaussian_front_weights / accum_gaussian_weights gives
+    // "fraction of this Gaussian's contribution that landed in front of GT"
+    // — the per-view signal for the multi-view front-side hard prune
+    // (mirror of accum_gaussian_sky_weights for sky_prune).
+    float* accum_gaussian_front_weights;
+
     // Input upstream gradients
     float* dL_dout_attr_float32;  // (H, W, C), gradient of RGB color or other features
 

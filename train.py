@@ -89,6 +89,7 @@ def training(args):
         "prune_opacity_sum": [],
         "prune_sky_sum": [],
         "prune_aniso_sum": [],
+        "prune_front_sum": [],
     }
     scene_id = str(args.scene_id) if isinstance(args.scene_id, int) else args.scene_id
     output_dir = os.path.join(
@@ -262,6 +263,7 @@ def training(args):
         means3d = render_pkg["means3D"]
         acc_wet = render_pkg["accum_gaussian_weight"]
         acc_sky_wet = render_pkg["accum_gaussian_sky_weight"]
+        acc_front_wet = render_pkg["accum_gaussian_front_weight"]
         accum_at_target = render_pkg["accum_at_target"]
 
         H, W = depth.shape[0], depth.shape[1]
@@ -434,6 +436,7 @@ def training(args):
             densify_info = scene.optimize(
                 args, iteration, means3d.grad, acc_wet, None, None,
                 sky_weights=acc_sky_wet,
+                front_weights=acc_front_wet,
             )
 
             points_num = 0
@@ -472,6 +475,11 @@ def training(args):
                 if log.get("prune_aniso_sum")
                 else densify_info[5]
             )
+            prune_front_sum = (
+                densify_info[6] + log["prune_front_sum"][-1]
+                if log.get("prune_front_sum")
+                else densify_info[6]
+            )
             log["depth_mse"].append(depth_mse)
             log["points_num"].append(points_num)
             log["clone_sum"].append(clone_sum)
@@ -480,6 +488,7 @@ def training(args):
             log["prune_opacity_sum"].append(prune_opacity_sum)
             log.setdefault("prune_sky_sum", []).append(prune_sky_sum)
             log.setdefault("prune_aniso_sum", []).append(prune_aniso_sum)
+            log.setdefault("prune_front_sum", []).append(prune_front_sum)
 
             # prepare loss stats for tensorboard record
             loss_stats = {
@@ -570,6 +579,7 @@ def training(args):
                         "train/prune_opacity_sum": prune_opacity_sum,
                         "train/prune_sky_sum": prune_sky_sum,
                         "train/prune_aniso_sum": prune_aniso_sum,
+                        "train/prune_front_sum": prune_front_sum,
                         # Learning rate
                         "train/lr_xyz": gaussians_assets[0].optimizer.param_groups[0]["lr"],
                     },

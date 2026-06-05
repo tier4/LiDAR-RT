@@ -306,9 +306,10 @@ class SceneLidar(Scene):
         visibility_filter_list,
         radii_list,
         sky_weights=None,
+        front_weights=None,
     ):
 
-        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num = 0, 0, 0, 0, 0, 0
+        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num, prune_front_num = 0, 0, 0, 0, 0, 0, 0
 
         sky_prune_enabled_global = bool(getattr(args.opt, "sky_prune_enabled", False))
         sky_prune_warmup_iter = int(getattr(args.opt, "sky_prune_warmup_iter", 0))
@@ -322,6 +323,13 @@ class SceneLidar(Scene):
         max_aniso_prune = float(getattr(args.opt, "max_aniso_prune", 10.0))
         aniso_prune_max_opacity = float(getattr(args.opt, "aniso_prune_max_opacity", 0.5))
 
+        front_prune_enabled_global = bool(getattr(args.opt, "front_prune_enabled", False))
+        front_prune_warmup_iter = int(getattr(args.opt, "front_prune_warmup_iter", 0))
+        front_ratio_threshold = float(getattr(args.opt, "front_prune_pixel_ratio_threshold", 0.8))
+        front_min_total_contrib = float(getattr(args.opt, "front_prune_min_total_contrib", 1e-3))
+        front_view_consistency = float(getattr(args.opt, "front_prune_view_consistency_threshold", 0.8))
+        front_min_views = int(getattr(args.opt, "front_prune_min_views", 3))
+
         begin_index = 0
         for gaussians in self.gaussians_assets:
             points_num = gaussians.get_local_xyz.shape[0]
@@ -329,21 +337,41 @@ class SceneLidar(Scene):
             instance_accum_weights = (
                 accum_weights[begin_index : begin_index + points_num] > 0
             )
-            # Accumulate sky stats per asset before begin_index advances.
-            # Only background Gaussians (no bounding box) get sky-pruned, since
-            # object Gaussians live inside a tracking box and the sky mask is
-            # not a valid criterion for them.
-            if (sky_weights is not None
-                    and sky_prune_enabled_global
-                    and gaussians.bounding_box is None
-                    and iteration >= sky_prune_warmup_iter):
+            # Accumulate sky / front-side stats per asset before begin_index
+            # advances. Only background Gaussians (no bounding box) get
+            # multi-view phantom-pruned — object Gaussians live inside a
+            # tracking box and these criteria are not valid for them.
+            asset_sky_active = (sky_weights is not None
+                                and sky_prune_enabled_global
+                                and gaussians.bounding_box is None
+                                and iteration >= sky_prune_warmup_iter)
+            asset_front_active = (front_weights is not None
+                                  and front_prune_enabled_global
+                                  and gaussians.bounding_box is None
+                                  and iteration >= front_prune_warmup_iter)
+            if asset_sky_active or asset_front_active:
                 instance_total = accum_weights[begin_index : begin_index + points_num]
-                instance_sky = sky_weights[begin_index : begin_index + points_num]
-                gaussians.add_sky_stats(
-                    instance_total, instance_sky,
-                    min_total_contrib=sky_min_total_contrib,
-                    sky_ratio_threshold=sky_ratio_threshold,
-                )
+                # Shared denominator: bump view_count once per active view.
+                # min_total_contrib uses whichever sub-stat is active (they
+                # should agree; both default to 1e-3).
+                bump_thresh = (sky_min_total_contrib if asset_sky_active
+                               else front_min_total_contrib)
+                gaussians.add_view_count(instance_total,
+                                         min_total_contrib=bump_thresh)
+                if asset_sky_active:
+                    instance_sky = sky_weights[begin_index : begin_index + points_num]
+                    gaussians.add_sky_stats(
+                        instance_total, instance_sky,
+                        min_total_contrib=sky_min_total_contrib,
+                        sky_ratio_threshold=sky_ratio_threshold,
+                    )
+                if asset_front_active:
+                    instance_front = front_weights[begin_index : begin_index + points_num]
+                    gaussians.add_front_stats(
+                        instance_total, instance_front,
+                        min_total_contrib=front_min_total_contrib,
+                        front_ratio_threshold=front_ratio_threshold,
+                    )
             begin_index += points_num
 
             # Per-asset cap: each asset (bg, each object) is gated on its
@@ -390,6 +418,11 @@ class SceneLidar(Scene):
                         and gaussians.bounding_box is None
                         and iteration >= aniso_prune_warmup_iter
                     )
+                    asset_front_prune_enabled = (
+                        front_prune_enabled_global
+                        and gaussians.bounding_box is None
+                        and iteration >= front_prune_warmup_iter
+                    )
                     densify_info = gaussians.densify_and_prune(
                         args.opt, 0.005, size_threshold,
                         sensor_centers=sensor_centers,
@@ -401,6 +434,9 @@ class SceneLidar(Scene):
                         aniso_prune_enabled=asset_aniso_prune_enabled,
                         max_aniso_prune=max_aniso_prune,
                         aniso_prune_max_opacity=aniso_prune_max_opacity,
+                        front_prune_enabled=asset_front_prune_enabled,
+                        front_view_consistency_threshold=front_view_consistency,
+                        front_prune_min_views=front_min_views,
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
@@ -408,6 +444,7 @@ class SceneLidar(Scene):
                     prune_opacity_num += densify_info[3]
                     prune_sky_num += densify_info[4]
                     prune_aniso_num += densify_info[5]
+                    prune_front_num += densify_info[6]
 
                 if iteration % args.opt.opacity_reset_interval == 0 or (
                     args.model.white_background
@@ -433,4 +470,4 @@ class SceneLidar(Scene):
                     gaussians._scaling.data.clamp_(min=math.log(min_scale))
 
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
-                prune_sky_num, prune_aniso_num)
+                prune_sky_num, prune_aniso_num, prune_front_num)

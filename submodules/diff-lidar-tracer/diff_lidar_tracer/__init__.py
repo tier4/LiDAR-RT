@@ -59,13 +59,13 @@ class _Tracer(torch.autograd.Function):
         if tracer_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target = _C.trace_surfels(*args)
+                out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights = _C.trace_surfels(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target = _C.trace_surfels(*args)
+            out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights = _C.trace_surfels(*args)
 
         # Keep relevant tensors for backward (incl. target_depth + accum_at_target
         # so the backward kernel can re-trace and reproduce the W_target running
@@ -80,11 +80,14 @@ class _Tracer(torch.autograd.Function):
         # tensor — used by the sky hard-prune path. accum_at_target is zero
         # unless target_depth was a non-empty tensor — used by the front-side
         # accumulation loss to penalise alpha contributions in front of the
-        # real LiDAR hit.
-        return out_attr_float32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target
+        # real LiDAR hit. accum_gaussian_front_weights is zero unless
+        # target_depth was supplied — per-Gaussian summed alpha*T limited to
+        # hits before target_depth, drives the multi-view front-side hard
+        # prune (mirror of accum_gaussian_sky_weights for sky_prune).
+        return out_attr_float32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights
 
     @staticmethod
-    def backward(ctx, grad_out_attr_float32, _, _sky, grad_accum_at_target):
+    def backward(ctx, grad_out_attr_float32, _, _sky, grad_accum_at_target, _front):
 
         # Restore necessary values from context
         tracer_settings = ctx.tracer_settings

@@ -146,7 +146,7 @@ def raytracing(
     )  # (V, 3), (F, 3)
     tracer.build_acceleration_structure(vertices, faces, rebuild=True)
 
-    rendered_tensor, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target = tracer(
+    rendered_tensor, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights = tracer(
         ray_o=rays_o,  # (H, W, 3)
         ray_d=rays_d,  # (H, W, 3)
         mesh_normals=mesh_normals,  # (V, 3)
@@ -196,4 +196,8 @@ def raytracing(
         # alpha*T over hits with dpt < target_depth. Used by the front-side
         # accumulation loss to detect phantoms in front of the real surface.
         "accum_at_target": accum_at_target,
+        # Zero when target_depth is None; otherwise per-Gaussian sum of
+        # alpha*T limited to hits before target_depth. Drives the multi-view
+        # front-side hard prune.
+        "accum_gaussian_front_weight": accum_gaussian_front_weights.unsqueeze(-1),
     }

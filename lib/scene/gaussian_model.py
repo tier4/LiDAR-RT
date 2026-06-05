@@ -51,6 +51,12 @@ class GaussianModel:
         # prune cycle. See add_sky_stats / prune_sky_mask in densify_and_prune.
         self.sky_view_count = torch.empty(0)
         self.view_count = torch.empty(0)
+        # Front-side hard-prune stats. front_view_count counts views where
+        # this Gaussian's contribution was concentrated in front of the GT
+        # target_depth (= phantom in front of the real surface). Shares
+        # view_count above as the denominator. See add_front_stats /
+        # the front_prune block in densify_and_prune.
+        self.front_view_count = torch.empty(0)
         self.optimizer = None
         self.densify_scale_threshold = 0
         self.spatial_lr_scale = 0
@@ -198,6 +204,7 @@ class GaussianModel:
         n = self.get_local_xyz.shape[0]
         self.sky_view_count = torch.zeros((n, 1), device="cuda")
         self.view_count = torch.zeros((n, 1), device="cuda")
+        self.front_view_count = torch.zeros((n, 1), device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -278,6 +285,8 @@ class GaussianModel:
         if self.sky_view_count.numel() > 0:
             self.sky_view_count = self.sky_view_count[valid_points_mask]
             self.view_count = self.view_count[valid_points_mask]
+        if self.front_view_count.numel() > 0:
+            self.front_view_count = self.front_view_count[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -330,6 +339,10 @@ class GaussianModel:
             )
             self.view_count = torch.cat(
                 [self.view_count, torch.zeros((num_new, 1), device="cuda")], dim=0
+            )
+        if self.front_view_count.numel() > 0 and num_new > 0:
+            self.front_view_count = torch.cat(
+                [self.front_view_count, torch.zeros((num_new, 1), device="cuda")], dim=0
             )
 
     def densify_and_split(self, grads, grad_threshold, N=2):
@@ -385,7 +398,10 @@ class GaussianModel:
                           sky_prune_min_views=3,
                           aniso_prune_enabled=False,
                           max_aniso_prune=10.0,
-                          aniso_prune_max_opacity=0.5):
+                          aniso_prune_max_opacity=0.5,
+                          front_prune_enabled=False,
+                          front_view_consistency_threshold=0.8,
+                          front_prune_min_views=3):
         # When skip_densify is True, we run only the pruning steps below
         # (low-opacity, bbox-escape, min_range_prune, big-points). This lets
         # us keep cleaning up after an asset has hit its point cap, instead
@@ -405,6 +421,7 @@ class GaussianModel:
         prune_opacity_num = low_opacity.sum().item()
         prune_scale_num = 0
         prune_aniso_num = 0
+        prune_front_num = 0
 
         # Anisotropy hard prune (bg only). T4's Hesai OT128 packs beams near
         # the horizon, and Tokyo urban scenes have building edges crossing
@@ -526,32 +543,67 @@ class GaussianModel:
                 prune_mask = torch.logical_or(prune_mask, sky_prune_mask)
                 print(f'Hard prune sky-mask phantoms: {prune_sky_num}')
 
+        # Front-side hard prune (mirror of sky_prune for hit rays). A bg
+        # Gaussian whose contribution sits *in front of* the LiDAR's real GT
+        # return across many views is a horizon-ring / near-range phantom
+        # that the front_acc loss can't eliminate fast enough (loss only
+        # pushes opacity down; opacity_reset resets it every 3K iter). The
+        # multi-view consistency requirement (>=min_views observations,
+        # >threshold fraction front-judged) guards against false positives
+        # at viewpoints where occlusion legitimately puts surfels in front.
+        if (front_prune_enabled and self.view_count.numel() > 0
+                and self.front_view_count.numel() > 0
+                and self.get_local_xyz.shape[0] > 0):
+            vc = self.view_count.squeeze(-1)
+            fvc = self.front_view_count.squeeze(-1)
+            enough_views = vc >= front_prune_min_views
+            front_ratio = fvc / vc.clamp_min(1.0)
+            mostly_front = front_ratio > front_view_consistency_threshold
+            front_prune_mask = enough_views & mostly_front
+            prune_front_num = front_prune_mask.sum().item()
+            if prune_front_num > 0:
+                prune_mask = torch.logical_or(prune_mask, front_prune_mask)
+                print(f'Hard prune front-of-GT phantoms: {prune_front_num}')
+
         if prune_mask.sum() < self.get_local_xyz.shape[0]:
             self.prune_points(prune_mask)
 
-        # Reset sky stats so the next densify cycle starts from a clean slate.
-        # We deliberately reset AFTER prune_points so the filter doesn't bypass
-        # the sky judgement above.
+        # Reset sky/front stats so the next densify cycle starts from a clean
+        # slate. We deliberately reset AFTER prune_points so the filter doesn't
+        # bypass the multi-view judgement above. view_count is shared as the
+        # denominator for both sky and front stats.
         if self.view_count.numel() > 0:
             self.sky_view_count.zero_()
             self.view_count.zero_()
+        if self.front_view_count.numel() > 0:
+            self.front_view_count.zero_()
 
         torch.cuda.empty_cache()
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
-                prune_sky_num, prune_aniso_num)
+                prune_sky_num, prune_aniso_num, prune_front_num)
 
     def add_densification_stats(self, mean_grads, update_filter):
         self.xyz_gradient_accum += torch.norm(mean_grads, dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
+    def add_view_count(self, total_weight, min_total_contrib=1e-3):
+        # Bump view_count for Gaussians observed (= contributed above
+        # min_total_contrib) in this view. view_count is the shared
+        # denominator for both sky_prune and front_prune ratios, so it must
+        # be bumped exactly once per view regardless of which sub-stats are
+        # being collected.
+        if self.view_count.numel() == 0:
+            return
+        tw = total_weight.view(-1)
+        observed = tw > min_total_contrib
+        if observed.any():
+            self.view_count[observed, 0] += 1
+
     def add_sky_stats(self, total_weight, sky_weight,
                       min_total_contrib=1e-3, sky_ratio_threshold=0.8):
-        # Per-view sky judgement. total_weight and sky_weight are (P,) tensors
-        # from the rasterizer: sum over rendered pixels of alpha*T (total) and
-        # alpha*T*sky_mask (sky). A Gaussian is "observed" in this view when
-        # its total contribution exceeds min_total_contrib (filters out
-        # Gaussians outside the rendered area or completely occluded), and
-        # "judged sky" when its sky/total ratio exceeds sky_ratio_threshold.
+        # Per-view sky judgement. Bumps sky_view_count only. Caller must
+        # bump view_count via add_view_count separately (so sky + front can
+        # share the denominator without double-counting).
         if self.view_count.numel() == 0:
             return
         tw = total_weight.view(-1)
@@ -561,8 +613,22 @@ class GaussianModel:
             return
         ratio = sw / tw.clamp_min(1e-12)
         sky_judged = observed & (ratio > sky_ratio_threshold)
-        self.view_count[observed, 0] += 1
         self.sky_view_count[sky_judged, 0] += 1
+
+    def add_front_stats(self, total_weight, front_weight,
+                        min_total_contrib=1e-3, front_ratio_threshold=0.8):
+        # Per-view front-side judgement (mirror of add_sky_stats). Bumps
+        # front_view_count only; caller bumps view_count via add_view_count.
+        if self.front_view_count.numel() == 0:
+            return
+        tw = total_weight.view(-1)
+        fw = front_weight.view(-1)
+        observed = tw > min_total_contrib
+        if not observed.any():
+            return
+        ratio = fw / tw.clamp_min(1e-12)
+        front_judged = observed & (ratio > front_ratio_threshold)
+        self.front_view_count[front_judged, 0] += 1
 
     # Refer to Street Gaussian by Yan et al. in 2024.
     def box_reg_loss(self):
