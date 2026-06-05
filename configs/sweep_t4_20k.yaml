@@ -62,8 +62,12 @@ metric:
 run_cap: 30
 
 command:
+  # wandb agent normally invokes `/usr/bin/env python` which fails on
+  # this host (no `python` symlink, only `python3` / repo's .venv).
+  # Point at the project's venv interpreter directly. ${program} is the
+  # train.py path resolved by wandb.
   - ${env}
-  - python
+  - .venv/bin/python
   - ${program}
   - -ec
   - configs/t4/exp_t4.yaml
