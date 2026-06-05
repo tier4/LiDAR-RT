@@ -148,7 +148,7 @@ void BuildAccelerationStructure(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 TraceSurfelsCUDA(
     const OptiXStateWrapper& stateWrapper,
     const bool training,
@@ -171,7 +171,10 @@ TraceSurfelsCUDA(
     const bool prefiltered,
     const bool debug,
     const torch::Tensor& pixel_weight,
-    const torch::Tensor& target_depth)
+    const torch::Tensor& target_depth,
+    const float contributor_alpha_threshold,
+    const float contributor_alpha_sharpness,
+    const bool enable_n_contributors)
 {
     // Create CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -218,6 +221,8 @@ TraceSurfelsCUDA(
     // Per-Gaussian front-side accumulator. Zero unless target_depth was
     // provided (non-empty); used by the multi-view front-side hard prune.
     torch::Tensor accum_gaussian_front_weights = torch::zeros({P}, float_opts);
+    // Soft per-pixel contributor count. Zero unless enable_n_contributors.
+    torch::Tensor n_contributors_soft = torch::zeros({H, W}, float_opts);
 
 
     // Create global parameters for the OptiX program
@@ -269,6 +274,14 @@ TraceSurfelsCUDA(
     params.accum_gaussian_front_weights = target_depth.numel() > 0
         ? accum_gaussian_front_weights.contiguous().data_ptr<float>()
         : nullptr;
+    // Soft contributor count (per-pixel). nullptr to skip the atomic path
+    // entirely when the loss is off.
+    params.n_contributors_soft = enable_n_contributors
+        ? n_contributors_soft.contiguous().data_ptr<float>()
+        : nullptr;
+    params.dL_dn_contributors_soft = nullptr;  // forward-only
+    params.contributor_alpha_threshold = contributor_alpha_threshold;
+    params.contributor_alpha_sharpness = contributor_alpha_sharpness;
 
 
     // Allocate memory for the parameters
@@ -286,10 +299,10 @@ TraceSurfelsCUDA(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Return
-    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
         out_attr_float32, out_attr_uint32, accum_gaussian_weights,
         accum_gaussian_sky_weights, accum_at_target,
-        accum_gaussian_front_weights);
+        accum_gaussian_front_weights, n_contributors_soft);
 }
 
 
@@ -319,7 +332,11 @@ TraceSurfelsBackwardCUDA(
     const torch::Tensor& dL_dout_attr_float32,
     const torch::Tensor& target_depth,
     const torch::Tensor& accum_at_target,
-    const torch::Tensor& dL_daccum_at_target
+    const torch::Tensor& dL_daccum_at_target,
+    const torch::Tensor& n_contributors_soft,
+    const torch::Tensor& dL_dn_contributors_soft,
+    const float contributor_alpha_threshold,
+    const float contributor_alpha_sharpness
 ){
     // Create CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -394,6 +411,14 @@ TraceSurfelsBackwardCUDA(
     params.accum_at_target = accum_at_target.numel() > 0 ? accum_at_target.contiguous().data_ptr<float>() : nullptr;
     params.dL_daccum_at_target = dL_daccum_at_target.numel() > 0 ? dL_daccum_at_target.contiguous().data_ptr<float>() : nullptr;
     params.accum_gaussian_front_weights = nullptr;  // forward-only path
+    // Soft contributor count: backward reads dL_dn_contributors_soft (when
+    // the loss requested it) and routes the sigmoid derivative back into α.
+    params.n_contributors_soft = n_contributors_soft.numel() > 0
+        ? n_contributors_soft.contiguous().data_ptr<float>() : nullptr;
+    params.dL_dn_contributors_soft = dL_dn_contributors_soft.numel() > 0
+        ? dL_dn_contributors_soft.contiguous().data_ptr<float>() : nullptr;
+    params.contributor_alpha_threshold = contributor_alpha_threshold;
+    params.contributor_alpha_sharpness = contributor_alpha_sharpness;
     // Store output gradients
     params.dL_dmeans3D = reinterpret_cast<glm::vec3*>(dL_dmeans3D.contiguous().data_ptr<float>());
     params.dL_dgrads3D_abs = reinterpret_cast<glm::vec3*>(dL_dgrads3D_abs.contiguous().data_ptr<float>());

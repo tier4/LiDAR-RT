@@ -56,9 +56,31 @@ opt:
   lambda_front_acc: 0.05  # Penalise alpha accumulated strictly in front of GT hit (or ∞ for sky).
                           # Front-side accumulation loss: directly attacks horizon-ring phantoms
                           # on hit rays that the sky-only freespace loss cannot see.
+
+  # Edge-boosted depth & front_acc loss: detect GT-depth discontinuities
+  # (Sobel gradient on gt_depth, both-side-valid only) and multiply both
+  # depth_loss and front_acc_loss by (1 + edge_loss_boost) at those pixels.
+  # Discourages the model from settling into a local minimum that fills
+  # the depth gap with a sheet of thin phantom Gaussians ("stacked
+  # phantom" pattern at horizon ring and ground edges). Off when either
+  # threshold or boost is 0.
+  edge_depth_grad_thresh: 5.0   # m/pixel; below this the pixel isn't an edge
+  edge_loss_boost: 2.0          # added on top of 1.0 → edge pixels get 3x
+
+  # Stack loss (B): kernel-level soft contributor count per pixel +
+  # edge-restricted L1 on (n_contributors - 1). Directly targets the
+  # "many thin Gaussians lined up at an edge" failure mode. Off when
+  # lambda_stack == 0 (the kernel skips the soft-counter atomic adds
+  # entirely so unused config stays cheap).
+  lambda_stack: 0.05
+  contributor_alpha_threshold: 0.1   # sigmoid midpoint over alpha
+  contributor_alpha_sharpness: 50.0  # higher → step-like
   lambda_occupancy: 0.05  # Penalise opacity of bg Gaussians sitting in voxels no LiDAR return ever hit
   occupancy_voxel_size: 0.1    # World-frame voxel size (m) for the occupancy grid
   occupancy_warmup_iter: 3000  # Gate the loss until densification has settled
+  occupancy_free_max_depth: 100.0  # Max ray length (m) traced during free-voxel
+                                   # discovery. Beyond this distance voxels stay
+                                   # "unknown" (no observation evidence)
 
   # Occupancy hard prune (bg only). The soft loss_occupancy is a
   # per-Gaussian-mean push that hovers at equilibrium because none of the
@@ -68,7 +90,10 @@ opt:
   # opacity exceeds threshold — definitionally a phantom (LiDAR never
   # returned there, yet it's rendering visibly). Reuses the same
   # OccupancyGrid the soft loss builds at startup.
-  occupancy_prune_enabled: true
+  occupancy_prune_enabled: false  # Disabled in favour of edge_loss_boost + lambda_stack
+                                  # which target edge phantoms at the source (densification)
+                                  # rather than removing them after the fact. Re-enable as
+                                  # a safety net if the new edge-aware losses don't suffice.
   occupancy_prune_warmup_iter: 3000      # gate until densification settled
   occupancy_prune_opacity_threshold: 0.5  # opa > this & in free voxel → kill
   min_range_prune: 1.0   # Hard-prune background Gaussians within this distance from any sensor

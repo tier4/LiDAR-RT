@@ -23,6 +23,9 @@ def raytracing(
     decomp=False,
     pixel_weight: torch.Tensor | None = None,
     target_depth: torch.Tensor | None = None,
+    contributor_alpha_threshold: float = 0.1,
+    contributor_alpha_sharpness: float = 50.0,
+    enable_n_contributors: bool = False,
 ):
 
     if decomp == "background":
@@ -146,7 +149,7 @@ def raytracing(
     )  # (V, 3), (F, 3)
     tracer.build_acceleration_structure(vertices, faces, rebuild=True)
 
-    rendered_tensor, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights = tracer(
+    rendered_tensor, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights, n_contributors_soft = tracer(
         ray_o=rays_o,  # (H, W, 3)
         ray_d=rays_d,  # (H, W, 3)
         mesh_normals=mesh_normals,  # (V, 3)
@@ -161,6 +164,9 @@ def raytracing(
         tracer_settings=tracer_settings,
         pixel_weight=pixel_weight,  # (H, W) float or None
         target_depth=target_depth,  # (H, W) float or None
+        contributor_alpha_threshold=contributor_alpha_threshold,
+        contributor_alpha_sharpness=contributor_alpha_sharpness,
+        enable_n_contributors=enable_n_contributors,
     )
 
     # mean2D
@@ -200,4 +206,9 @@ def raytracing(
         # alpha*T limited to hits before target_depth. Drives the multi-view
         # front-side hard prune.
         "accum_gaussian_front_weight": accum_gaussian_front_weights.unsqueeze(-1),
+        # Zero unless enable_n_contributors=True; otherwise per-pixel soft
+        # count of significant alpha-blended Gaussian contributions
+        # (sigmoid-thresholded). Used by the edge-aware stacking loss to
+        # penalise "many thin Gaussians per edge pixel".
+        "n_contributors_soft": n_contributors_soft,
     }

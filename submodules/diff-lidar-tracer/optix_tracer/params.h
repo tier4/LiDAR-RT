@@ -94,6 +94,17 @@ struct Params
     // (mirror of accum_gaussian_sky_weights for sky_prune).
     float* accum_gaussian_front_weights;
 
+    // Soft per-pixel contributor count (H, W). At each hit, the kernel adds
+    // sigmoid((alpha - contributor_alpha_threshold) * contributor_alpha_sharpness)
+    // — so high-α hits contribute ≈1, low-α hits ≈0, smoothly differentiable.
+    // Lets a Python loss penalise "edge pixels with many stacked thin
+    // Gaussians" by L1 on (n_contributors - 1). Backward picks up
+    // dL_dn_contributors and routes the sigmoid derivative back into α.
+    float* n_contributors_soft;          // (H, W)
+    float* dL_dn_contributors_soft;      // (H, W) backward upstream grad
+    float  contributor_alpha_threshold;  // sigmoid midpoint (alpha value)
+    float  contributor_alpha_sharpness;  // larger → step-like
+
     // Input upstream gradients
     float* dL_dout_attr_float32;  // (H, W, C), gradient of RGB color or other features
 

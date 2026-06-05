@@ -298,6 +298,19 @@ extern "C" __global__ void __raygen__ot()
                 atomicAdd(params.accum_gaussian_front_weights + gidx, w);
             }
 
+            // Soft contributor count: sigmoid-thresholded over alpha. A
+            // single high-α surface Gaussian contributes ≈1; a stack of
+            // thin phantoms each contribute ≈0; the total per-pixel sum is
+            // the smooth "how many real contributors does this ray have".
+            // The Python edge-aware stack loss compares this to 1 at edge
+            // pixels.
+            if (params.n_contributors_soft != nullptr) {
+                float sig_arg = (alpha - params.contributor_alpha_threshold)
+                                * params.contributor_alpha_sharpness;
+                float sig = 1.0f / (1.0f + expf(-sig_arg));
+                atomicAdd(params.n_contributors_soft + tidx, sig);
+            }
+
             // Update transmittence
             T = test_T;
 

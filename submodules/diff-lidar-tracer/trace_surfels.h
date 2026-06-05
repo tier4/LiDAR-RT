@@ -26,7 +26,7 @@ BuildAccelerationStructure(
     unsigned int rebuild);
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 TraceSurfelsCUDA(
     const OptiXStateWrapper& stateWrapper,
     const bool training,
@@ -49,7 +49,10 @@ TraceSurfelsCUDA(
     const bool prefiltered,
     const bool debug,
     const torch::Tensor& pixel_weight,
-    const torch::Tensor& target_depth);
+    const torch::Tensor& target_depth,
+    const float contributor_alpha_threshold,
+    const float contributor_alpha_sharpness,
+    const bool enable_n_contributors);
 
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -78,5 +81,9 @@ TraceSurfelsBackwardCUDA(
     const torch::Tensor& dL_dout_attr_float32,
     const torch::Tensor& target_depth,
     const torch::Tensor& accum_at_target,
-    const torch::Tensor& dL_daccum_at_target
+    const torch::Tensor& dL_daccum_at_target,
+    const torch::Tensor& n_contributors_soft,
+    const torch::Tensor& dL_dn_contributors_soft,
+    const float contributor_alpha_threshold,
+    const float contributor_alpha_sharpness
 );

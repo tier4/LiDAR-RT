@@ -479,6 +479,14 @@ extern "C" __global__ void __raygen__ot()
 							 && params.dL_daccum_at_target != nullptr);
 	const float target_dpt = has_target ? params.target_depth[tidx] : 0.0f;
 	const float dL_dacc_target = has_target ? params.dL_daccum_at_target[tidx] : 0.0f;
+
+	// Soft contributor count gradient. Each hit routes back through the
+	// sigmoid threshold: d(sig)/d(alpha) = sharpness * sig * (1 - sig).
+	const bool has_n_contrib = (params.dL_dn_contributors_soft != nullptr);
+	const float dL_dn_contrib = has_n_contrib
+		? params.dL_dn_contributors_soft[tidx] : 0.0f;
+	const float contrib_thresh = params.contributor_alpha_threshold;
+	const float contrib_sharp = params.contributor_alpha_sharpness;
 	float3 dL_dnorm = make_float3(
 		params.dL_dout_attr_float32[NUM_CHANNELS_F * tidx + NORMAL_OFFSET],
 		params.dL_dout_attr_float32[NUM_CHANNELS_F * tidx + NORMAL_OFFSET + 1],
@@ -631,6 +639,15 @@ extern "C" __global__ void __raygen__ot()
 			if (has_target && target_dpt > 0.0f && dpt < target_dpt) {
 				dL_dalpha += dL_dacc_target *
 					(T - (final_W_target - W_target) * inv_1_alpha);
+			}
+
+			// Soft contributor count: route the per-pixel grad back into
+			// alpha via the sigmoid derivative. Pushes alpha down on
+			// pixels where the loss said "you have too many contributors".
+			if (has_n_contrib) {
+				float sig_arg = (alpha - contrib_thresh) * contrib_sharp;
+				float sig = 1.0f / (1.0f + expf(-sig_arg));
+				dL_dalpha += dL_dn_contrib * contrib_sharp * sig * (1.0f - sig);
 			}
 
 			float3 dL_dnormal_gs = dL_dnorm * w;

@@ -170,21 +170,36 @@ def training(args):
     )
     first_iter += 1
 
-    # Build a one-shot world-frame occupancy grid from training LiDAR points
-    # with dynamic-bbox interiors removed. Used downstream to penalise the
-    # opacity of bg Gaussians that sit in voxels no LiDAR return ever fell
-    # into — a structural anti-phantom signal independent of sky masks.
+    # Build a one-shot world-frame three-state occupancy grid (occupied /
+    # free / unknown). Used downstream by loss_occupancy and occupancy_prune
+    # to penalise / kill bg Gaussians sitting in voxels that some training
+    # ray *actively observed empty*. Voxels that no ray ever entered remain
+    # "unknown" — we don't punish phantoms there because there's no
+    # observation evidence either way. Result is cached to disk; subsequent
+    # runs with the same data + voxel_size load in <1 s.
     lambda_occupancy = float(getattr(args.opt, "lambda_occupancy", 0.0))
     occupancy_warmup_iter = int(getattr(args.opt, "occupancy_warmup_iter", 0))
+    occupancy_prune_enabled_check = bool(getattr(args.opt, "occupancy_prune_enabled", False))
     occupancy_grid = None
-    if lambda_occupancy > 0:
+    if lambda_occupancy > 0 or occupancy_prune_enabled_check:
         from lib.scene.occupancy_grid import WorldOccupancyGrid
         occ_voxel_size = float(getattr(args.opt, "occupancy_voxel_size", 0.5))
+        occ_max_depth = float(getattr(args.opt, "occupancy_free_max_depth", 100.0))
         occupancy_grid = WorldOccupancyGrid(voxel_size=occ_voxel_size)
-        stats = occupancy_grid.build(scene.train_lidars, gaussians_assets[1:])
-        print(f"[Occupancy] voxel_size={stats['voxel_size']}  "
-              f"frames={stats['n_frames']}  points={stats['n_points']}  "
-              f"occupied_voxels={stats['n_voxels']}")
+        cache_dir = os.path.join(args.model_dir, ".occupancy_grid_cache")
+        stats = occupancy_grid.build_or_load_cache(
+            scene.train_lidars, gaussians_assets[1:],
+            max_depth=occ_max_depth,
+            cache_dir=cache_dir,
+            cache_extra={"source_dir": str(getattr(args, "source_dir", "")),
+                         "frame_length": list(args.frame_length)},
+        )
+        cache_tag = "(cached)" if stats.get("cached") else "(built)"
+        print(f"[Occupancy] {cache_tag} voxel_size={stats['voxel_size']}  "
+              f"occupied_voxels={stats['n_occupied']}  "
+              f"free_voxels={stats['n_free']}  "
+              f"rays_used={stats.get('n_rays_used', 0)}  "
+              f"hit_points_used={stats.get('n_points_used', 0)}")
 
     end = time.time()
     frame_s, frame_e = args.frame_length[0], args.frame_length[1]
@@ -251,10 +266,23 @@ def training(args):
         else:
             target_depth = None
 
+        # Stack loss is opt-in (kernel atomic adds + backward grad have a
+        # cost). Skip the per-pixel n_contributors output when lambda_stack
+        # is zero so production runs stay at unchanged kernel speed.
+        lambda_stack = float(getattr(args.opt, "lambda_stack", 0.0))
+        contrib_alpha_thresh = float(
+            getattr(args.opt, "contributor_alpha_threshold", 0.1))
+        contrib_alpha_sharp = float(
+            getattr(args.opt, "contributor_alpha_sharpness", 50.0))
+        enable_n_contrib = (lambda_stack > 0)
+
         render_pkg = raytracing(
             frame, gaussians_assets, cur_lidar, background, args,
             pixel_weight=pixel_weight,
             target_depth=target_depth,
+            contributor_alpha_threshold=contrib_alpha_thresh,
+            contributor_alpha_sharpness=contrib_alpha_sharp,
+            enable_n_contributors=enable_n_contrib,
         )
         batch_time = time.time() - end
         depth = render_pkg["depth"]
@@ -266,15 +294,53 @@ def training(args):
         acc_sky_wet = render_pkg["accum_gaussian_sky_weight"]
         acc_front_wet = render_pkg["accum_gaussian_front_weight"]
         accum_at_target = render_pkg["accum_at_target"]
+        n_contributors_soft = render_pkg["n_contributors_soft"]
 
         H, W = depth.shape[0], depth.shape[1]
 
-        # === Depth loss ===
-        depth = depth.squeeze(-1)
+        # === GT-depth edge mask ===
+        # Detect pixels where the GT depth has a strong spatial discontinuity
+        # (= adjacent pixels look at very different surfaces). These are
+        # exactly where the model is tempted to fill the gap with a sheet
+        # of thin phantom Gaussians. Boost depth/front-acc losses on these
+        # pixels so the local-minimum solution costs more than the correct
+        # single-surface solution.
         gt_depth = cur_lidar.get_depth(frame).cuda()
-        loss_depth = args.opt.lambda_depth_l1 * l1_loss(
-            depth[gt_mask], gt_depth[gt_mask]
-        )
+        edge_grad_thresh = float(getattr(args.opt, "edge_depth_grad_thresh", 0.0))
+        edge_loss_boost = float(getattr(args.opt, "edge_loss_boost", 0.0))
+        if edge_grad_thresh > 0 and edge_loss_boost > 0:
+            with torch.no_grad():
+                # Both-side validity: only call a gradient an "edge" if both
+                # neighbours had a valid GT return — otherwise the gradient
+                # is a no-return / return boundary, not a true geometric edge.
+                gt_d = gt_depth.unsqueeze(0).unsqueeze(0)
+                # Sobel via fixed conv2d kernels (allocated once would be
+                # nicer, but the cost is negligible vs the rendering).
+                sx = torch.tensor([[[[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]]],
+                                   device=gt_d.device, dtype=gt_d.dtype)
+                sy = sx.transpose(-1, -2).contiguous()
+                gx = F.conv2d(gt_d, sx, padding=1).squeeze()
+                gy = F.conv2d(gt_d, sy, padding=1).squeeze()
+                edge_mag = torch.sqrt(gx * gx + gy * gy)
+                # Suppress edges where any pixel in the 3x3 neighbourhood was
+                # invalid (= no LiDAR return). max_pool of ~gt_mask catches this.
+                invalid = (~gt_mask).float().unsqueeze(0).unsqueeze(0)
+                any_invalid = F.max_pool2d(invalid, 3, stride=1, padding=1).squeeze() > 0.5
+                edge_mask = (edge_mag > edge_grad_thresh) & ~any_invalid & gt_mask
+            edge_weight = 1.0 + edge_loss_boost * edge_mask.float()
+        else:
+            edge_mask = torch.zeros_like(gt_mask, dtype=torch.bool)
+            edge_weight = torch.ones_like(gt_depth)
+
+        # === Depth loss (edge-boosted) ===
+        depth = depth.squeeze(-1)
+        if edge_loss_boost > 0:
+            depth_l1_pixel = (depth - gt_depth).abs() * edge_weight
+            loss_depth = args.opt.lambda_depth_l1 * depth_l1_pixel[gt_mask].mean()
+        else:
+            loss_depth = args.opt.lambda_depth_l1 * l1_loss(
+                depth[gt_mask], gt_depth[gt_mask]
+            )
 
         # === Intensity loss ===
         intensity = intensity.squeeze(-1)
@@ -375,11 +441,28 @@ def training(args):
         if lambda_front_acc > 0:
             front_phantom = accum_at_target > 0
             if front_phantom.any():
-                loss_front_acc = lambda_front_acc * accum_at_target[front_phantom].mean()
+                # Edge-boosted: phantoms at GT-depth edges are penalised
+                # more heavily because that's where they collect to fill
+                # the depth gap (local-minimum trap).
+                weighted_acc = accum_at_target * edge_weight
+                loss_front_acc = lambda_front_acc * weighted_acc[front_phantom].mean()
             else:
                 loss_front_acc = torch.tensor(0.0, device="cuda")
         else:
             loss_front_acc = torch.tensor(0.0, device="cuda")
+
+        # === Edge stacking loss ===
+        # On GT-edge pixels, penalise (n_contributors - 1).clamp_min(0):
+        # the optimal "one solid surface" solution gives ≈1, while the
+        # local-minimum "stacked thin phantoms" solution gives ≥2-3.
+        # Active only on edge pixels (edge_mask) and only when
+        # lambda_stack > 0 (kernel skips the soft-counter atomic adds
+        # otherwise).
+        if lambda_stack > 0 and edge_mask.any():
+            excess = (n_contributors_soft - 1.0).clamp_min(0.0)
+            loss_stack = lambda_stack * excess[edge_mask].mean()
+        else:
+            loss_stack = torch.tensor(0.0, device="cuda")
 
         # === 3D occupancy loss ===
         # Penalises the opacity of background Gaussians whose centres sit in
@@ -402,7 +485,7 @@ def training(args):
         else:
             loss_occupancy = torch.tensor(0.0, device="cuda")
 
-        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace + loss_occupancy + loss_front_acc
+        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace + loss_occupancy + loss_front_acc + loss_stack
 
         # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
         if not torch.isfinite(loss):
@@ -555,6 +638,7 @@ def training(args):
                         "train/depth_mae": depth_mae,
                         # Near-range phantom pixel count (per current frame)
                         "train/phantom_pixels": train_phantom_pixels,
+                        "train/edge_pixels": int(edge_mask.sum().item()),
                         # Intensity (weighted total + unweighted components)
                         "train/intensity_loss": loss_intensity.item(),
                         "train/intensity_l1": int_l1,
@@ -577,6 +661,8 @@ def training(args):
                         "train/freespace_loss": loss_freespace.item(),
                         # Front-side accumulation supervision
                         "train/front_acc_loss": loss_front_acc.item(),
+                        # Edge stacking supervision
+                        "train/stack_loss": loss_stack.item(),
                         # 3D occupancy supervision
                         "train/occupancy_loss": loss_occupancy.item(),
                         # Densification

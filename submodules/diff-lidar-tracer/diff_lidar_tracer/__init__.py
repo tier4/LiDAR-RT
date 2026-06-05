@@ -29,6 +29,9 @@ class _Tracer(torch.autograd.Function):
                 tracer_settings,
                 pixel_weight,
                 target_depth,
+                contributor_alpha_threshold,
+                contributor_alpha_sharpness,
+                enable_n_contributors,
                 ):
 
         # Restructure arguments the way that the C++ lib expects them
@@ -53,27 +56,32 @@ class _Tracer(torch.autograd.Function):
                 tracer_settings.prefiltered,
                 tracer_settings.debug,
                 pixel_weight,
-                target_depth)
+                target_depth,
+                float(contributor_alpha_threshold),
+                float(contributor_alpha_sharpness),
+                bool(enable_n_contributors))
 
         # Invoke C++/CUDA/OptiX tracer
         if tracer_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights = _C.trace_surfels(*args)
+                out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights, n_contributors_soft = _C.trace_surfels(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights = _C.trace_surfels(*args)
+            out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights, n_contributors_soft = _C.trace_surfels(*args)
 
         # Keep relevant tensors for backward (incl. target_depth + accum_at_target
         # so the backward kernel can re-trace and reproduce the W_target running
         # sum and gradient term).
         ctx.tracer_settings = tracer_settings
         ctx.optix_context = optix_context
+        ctx.contributor_alpha_threshold = float(contributor_alpha_threshold)
+        ctx.contributor_alpha_sharpness = float(contributor_alpha_sharpness)
         ctx.save_for_backward(ray_o, ray_d, vertices, means3D, shs, colors_precomp, opacities, scales, rotations, cov3Ds_precomp,
-                              out_attr_float32, out_attr_uint32, target_depth, accum_at_target)
+                              out_attr_float32, out_attr_uint32, target_depth, accum_at_target, n_contributors_soft)
 
         # Return the per-Gaussian hit counter for training gradient filtering.
         # accum_gaussian_sky_weights is zero unless pixel_weight was a non-empty
@@ -84,17 +92,19 @@ class _Tracer(torch.autograd.Function):
         # target_depth was supplied — per-Gaussian summed alpha*T limited to
         # hits before target_depth, drives the multi-view front-side hard
         # prune (mirror of accum_gaussian_sky_weights for sky_prune).
-        return out_attr_float32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights
+        return out_attr_float32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target, accum_gaussian_front_weights, n_contributors_soft
 
     @staticmethod
-    def backward(ctx, grad_out_attr_float32, _, _sky, grad_accum_at_target, _front):
+    def backward(ctx, grad_out_attr_float32, _, _sky, grad_accum_at_target, _front, grad_n_contributors_soft):
 
         # Restore necessary values from context
         tracer_settings = ctx.tracer_settings
         optix_context = ctx.optix_context
+        contributor_alpha_threshold = ctx.contributor_alpha_threshold
+        contributor_alpha_sharpness = ctx.contributor_alpha_sharpness
         (ray_o, ray_d, vertices, means3D, shs, colors_precomp, opacities, scales,
          rotations, cov3Ds_precomp, out_attr_float32, out_attr_uint32,
-         target_depth, accum_at_target) = ctx.saved_tensors
+         target_depth, accum_at_target, n_contributors_soft) = ctx.saved_tensors
         # Restructure args as C++ method expects them
         args = (optix_context,
                 ray_o,
@@ -120,7 +130,11 @@ class _Tracer(torch.autograd.Function):
                 grad_out_attr_float32,
                 target_depth,
                 accum_at_target,
-                grad_accum_at_target)
+                grad_accum_at_target,
+                n_contributors_soft,
+                grad_n_contributors_soft,
+                contributor_alpha_threshold,
+                contributor_alpha_sharpness)
 
         # Compute gradients for relevant tensors by invoking backward method
         if tracer_settings.debug:
@@ -150,6 +164,9 @@ class _Tracer(torch.autograd.Function):
             None,
             None,  # pixel_weight (not differentiated)
             None,  # target_depth (not differentiated)
+            None,  # contributor_alpha_threshold (scalar, not differentiated)
+            None,  # contributor_alpha_sharpness (scalar, not differentiated)
+            None,  # enable_n_contributors (bool, not differentiated)
         )
 
         return grads
@@ -204,6 +221,9 @@ class Tracer(nn.Module):
                 tracer_settings: TracingSettings = None,
                 pixel_weight: torch.Tensor = None,
                 target_depth: torch.Tensor = None,
+                contributor_alpha_threshold: float = 0.1,
+                contributor_alpha_sharpness: float = 50.0,
+                enable_n_contributors: bool = False,
                 ):
 
         # Check if colors or SHs are provided
@@ -244,4 +264,7 @@ class Tracer(nn.Module):
             tracer_settings,
             pixel_weight,
             target_depth,
+            contributor_alpha_threshold,
+            contributor_alpha_sharpness,
+            enable_n_contributors,
         )
