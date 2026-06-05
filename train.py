@@ -88,6 +88,7 @@ def training(args):
         "prune_scale_sum": [],
         "prune_opacity_sum": [],
         "prune_sky_sum": [],
+        "prune_aniso_sum": [],
     }
     scene_id = str(args.scene_id) if isinstance(args.scene_id, int) else args.scene_id
     output_dir = os.path.join(
@@ -433,6 +434,11 @@ def training(args):
                 if log.get("prune_sky_sum")
                 else densify_info[4]
             )
+            prune_aniso_sum = (
+                densify_info[5] + log["prune_aniso_sum"][-1]
+                if log.get("prune_aniso_sum")
+                else densify_info[5]
+            )
             log["depth_mse"].append(depth_mse)
             log["points_num"].append(points_num)
             log["clone_sum"].append(clone_sum)
@@ -440,6 +446,7 @@ def training(args):
             log["prune_scale_sum"].append(prune_scale_sum)
             log["prune_opacity_sum"].append(prune_opacity_sum)
             log.setdefault("prune_sky_sum", []).append(prune_sky_sum)
+            log.setdefault("prune_aniso_sum", []).append(prune_aniso_sum)
 
             # prepare loss stats for tensorboard record
             loss_stats = {
@@ -513,6 +520,7 @@ def training(args):
                         "train/prune_scale_sum": prune_scale_sum,
                         "train/prune_opacity_sum": prune_opacity_sum,
                         "train/prune_sky_sum": prune_sky_sum,
+                        "train/prune_aniso_sum": prune_aniso_sum,
                         # Learning rate
                         "train/lr_xyz": gaussians_assets[0].optimizer.param_groups[0]["lr"],
                     },
@@ -633,6 +641,15 @@ def training(args):
                                 f"error (cap={err_cap:.2f}m)"
                             ),
                         ),
+                        # Magenta pixel counts — the per-frame proxy for
+                        # how many near-range phantoms (0 < depth <=
+                        # viz_min_depth) are still surviving. Logging the
+                        # all-asset and bg-only counts separately so an
+                        # increase can be attributed to bg drift vs
+                        # tracked-object Gaussians that legitimately sit
+                        # close to the sensor on this frame.
+                        "viz/phantom_pixels_all": int(pred_phantom.sum()),
+                        "viz/phantom_pixels_bg": int(bg_phantom.sum()),
                     }
                     # Depth-error histogram over pixels where BOTH GT and the
                     # rendered image have a return (err_valid). Fixed bins so

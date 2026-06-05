@@ -308,7 +308,7 @@ class SceneLidar(Scene):
         sky_weights=None,
     ):
 
-        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num = 0, 0, 0, 0, 0
+        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num = 0, 0, 0, 0, 0, 0
 
         sky_prune_enabled_global = bool(getattr(args.opt, "sky_prune_enabled", False))
         sky_prune_warmup_iter = int(getattr(args.opt, "sky_prune_warmup_iter", 0))
@@ -316,6 +316,11 @@ class SceneLidar(Scene):
         sky_min_total_contrib = float(getattr(args.opt, "sky_prune_min_total_contrib", 1e-3))
         sky_view_consistency = float(getattr(args.opt, "sky_prune_view_consistency_threshold", 0.8))
         sky_min_views = int(getattr(args.opt, "sky_prune_min_views", 3))
+
+        aniso_prune_enabled_global = bool(getattr(args.opt, "aniso_prune_enabled", False))
+        aniso_prune_warmup_iter = int(getattr(args.opt, "aniso_prune_warmup_iter", 0))
+        max_aniso_prune = float(getattr(args.opt, "max_aniso_prune", 10.0))
+        aniso_prune_max_opacity = float(getattr(args.opt, "aniso_prune_max_opacity", 0.5))
 
         begin_index = 0
         for gaussians in self.gaussians_assets:
@@ -380,6 +385,11 @@ class SceneLidar(Scene):
                         and gaussians.bounding_box is None
                         and iteration >= sky_prune_warmup_iter
                     )
+                    asset_aniso_prune_enabled = (
+                        aniso_prune_enabled_global
+                        and gaussians.bounding_box is None
+                        and iteration >= aniso_prune_warmup_iter
+                    )
                     densify_info = gaussians.densify_and_prune(
                         args.opt, 0.005, size_threshold,
                         sensor_centers=sensor_centers,
@@ -388,12 +398,16 @@ class SceneLidar(Scene):
                         sky_prune_enabled=asset_sky_prune_enabled,
                         sky_view_consistency_threshold=sky_view_consistency,
                         sky_prune_min_views=sky_min_views,
+                        aniso_prune_enabled=asset_aniso_prune_enabled,
+                        max_aniso_prune=max_aniso_prune,
+                        aniso_prune_max_opacity=aniso_prune_max_opacity,
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
                     prune_scale_num += densify_info[2]
                     prune_opacity_num += densify_info[3]
                     prune_sky_num += densify_info[4]
+                    prune_aniso_num += densify_info[5]
 
                 if iteration % args.opt.opacity_reset_interval == 0 or (
                     args.model.white_background
@@ -418,4 +432,5 @@ class SceneLidar(Scene):
                 if min_scale > 0:
                     gaussians._scaling.data.clamp_(min=math.log(min_scale))
 
-        return clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num
+        return (clone_num, split_num, prune_scale_num, prune_opacity_num,
+                prune_sky_num, prune_aniso_num)

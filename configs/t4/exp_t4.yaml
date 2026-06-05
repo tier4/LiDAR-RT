@@ -79,6 +79,17 @@ opt:
   # hard-prunes. Catches phantoms that escaped the in-training 100-iter window.
   # Saves a separate model_it_<iter>_skyprune.pth checkpoint.
   sky_prune_final_sweep: true
+
+  # Anisotropy hard-prune (bg only): kills bg Gaussians whose 2D-surfel ellipsoid
+  # is line-like (sigma_max/sigma_min > max_aniso_prune) AND has moderate-or-
+  # lower opacity. Targets the horizon-ring edge phantoms that the Hesai
+  # OT128's beam clustering near z=sensor produces in dense urban scenes.
+  # Object Gaussians are exempt (vehicles are legitimately elongated).
+  aniso_prune_enabled: true
+  aniso_prune_warmup_iter: 3000   # Gate until densification has settled
+  max_aniso_prune: 10.0           # sigma_max/sigma_min threshold (p90 of bg=11.8)
+  aniso_prune_max_opacity: 0.5    # Spare high-opacity Gaussians (likely real walls)
+
   use_rayhit: True
 
   use_normal_init: True

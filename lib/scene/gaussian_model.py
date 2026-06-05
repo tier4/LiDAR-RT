@@ -382,7 +382,10 @@ class GaussianModel:
                           skip_densify=False,
                           sky_prune_enabled=False,
                           sky_view_consistency_threshold=0.8,
-                          sky_prune_min_views=3):
+                          sky_prune_min_views=3,
+                          aniso_prune_enabled=False,
+                          max_aniso_prune=10.0,
+                          aniso_prune_max_opacity=0.5):
         # When skip_densify is True, we run only the pruning steps below
         # (low-opacity, bbox-escape, min_range_prune, big-points). This lets
         # us keep cleaning up after an asset has hit its point cap, instead
@@ -401,6 +404,30 @@ class GaussianModel:
         prune_mask = low_opacity
         prune_opacity_num = low_opacity.sum().item()
         prune_scale_num = 0
+        prune_aniso_num = 0
+
+        # Anisotropy hard prune (bg only). T4's Hesai OT128 packs beams near
+        # the horizon, and Tokyo urban scenes have building edges crossing
+        # the horizon line in every direction. The combination produces a
+        # ring of edge-tracking phantoms at sensor height (z≈2.18 m) that
+        # share a signature: extremely elongated 2D surfels (σ_max/σ_min ≫ 1)
+        # with moderate opacity. Catch them at densify time so the BVH and
+        # the depth/intensity losses don't keep dragging more in around the
+        # same edge each cycle. Object Gaussians stay exempt — vehicles
+        # legitimately are elongated and the bbox-escape check guards them.
+        if (aniso_prune_enabled and self.bounding_box is None
+                and self.get_local_xyz.shape[0] > 0):
+            sigma = self.get_scaling
+            sig_min = sigma.min(dim=-1).values
+            sig_max = sigma.max(dim=-1).values
+            aniso = sig_max / sig_min.clamp_min(1e-12)
+            opa = self.get_opacity.squeeze(-1)
+            aniso_phantom = (aniso > max_aniso_prune) & (opa < aniso_prune_max_opacity)
+            prune_aniso_num = int(aniso_phantom.sum().item())
+            if prune_aniso_num > 0:
+                prune_mask = torch.logical_or(prune_mask, aniso_phantom)
+                print(f'Hard prune aniso>{max_aniso_prune} & opa<{aniso_prune_max_opacity}: '
+                      f'{prune_aniso_num}')
 
         # Hard prune: object Gaussians whose center has escaped the bbox.
         # Runs every densification step (not gated by max_screen_size) so
@@ -510,7 +537,8 @@ class GaussianModel:
             self.view_count.zero_()
 
         torch.cuda.empty_cache()
-        return clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num
+        return (clone_num, split_num, prune_scale_num, prune_opacity_num,
+                prune_sky_num, prune_aniso_num)
 
     def add_densification_stats(self, mean_grads, update_filter):
         self.xyz_gradient_accum += torch.norm(mean_grads, dim=-1, keepdim=True)
