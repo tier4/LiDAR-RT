@@ -38,14 +38,27 @@ opt:
                                    # Cuts the iter 0-1000 churn observed
                                    # in the last run (~200K early prunes).
   densify_until_iter: 15_000
-  densify_until_num_points: 1_000_000  # Was 2_000_000. Per-asset cap; once
+  densify_until_num_points: 500_000    # Was 2M, then 1M. Render-sweep analysis
+                                       # showed only 22% of bg (470K of 2.13M)
+                                       # accumulated any weight across all train
+                                       # frames — 78% were dead. Combined with
+                                       # the new dead_prune (kills 0-view-count
+                                       # Gaussians inline), capping at 500K keeps
+                                       # roughly all-alive bg with no quality
+                                       # loss. Reduces GPU + BVH cost by ~4x.
                                        # bg reaches this, only prune fires
                                        # (skip_densify=True). Bounds final
                                        # population near a sustainable size.
 
   densify_use_absgrads: False
   densify_scale_threshold: 0.0002
-  densify_grad_threshold: 0.001   # Was 0.0002, then 0.0005. With reset
+  densify_grad_threshold: 0.002   # Was 0.001 (and 0.0005 before). Halved spawn
+                                  # rate. Combined with 500K cap above and the
+                                  # dead_prune, expected steady-state spawn/
+                                  # prune cumulative drops 3-4x from the prior
+                                  # run's 12M/10M, and final pop lands near
+                                  # 300-500K bg — close to the 470K we measured
+                                  # as actually active in the prior ckpt. With reset
                                   # disabled and a 1M cap, the model needs
                                   # to be more selective about WHICH high-
                                   # gradient pixels actually warrant a new
