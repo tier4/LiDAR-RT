@@ -1296,6 +1296,10 @@ if __name__ == "__main__":
     parser.add_argument("--densify_until_num_points", type=int, default=None)
     parser.add_argument("--thresh_opa_prune", type=float, default=None)
     parser.add_argument("--densify_from_iter", type=int, default=None)
+    parser.add_argument("--densify_until_iter", type=int, default=None)
+    parser.add_argument("--edge_loss_boost", type=float, default=None)
+    parser.add_argument("--lambda_stack", type=float, default=None)
+    parser.add_argument("--dead_prune_min_views", type=int, default=None)
     parser.add_argument("--exp_suffix", type=str, default="",
                         help="Append to exp_name (use to keep sweep run dirs distinct)")
     launch_args = parser.parse_args()
@@ -1322,6 +1326,12 @@ if __name__ == "__main__":
         "densify_until_num_points": launch_args.densify_until_num_points,
         "thresh_opa_prune": launch_args.thresh_opa_prune,
         "densify_from_iter": launch_args.densify_from_iter,
+        "densify_until_iter": launch_args.densify_until_iter,
+        # Edge-aware losses
+        "edge_loss_boost": launch_args.edge_loss_boost,
+        "lambda_stack": launch_args.lambda_stack,
+        # Dead-Gaussian prune
+        "dead_prune_min_views": launch_args.dead_prune_min_views,
     }
     for k, v in opt_overrides.items():
         if v is not None:

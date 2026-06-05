@@ -1,29 +1,64 @@
 # Wandb sweep config for 20K-iteration hyperparameter search on the default
-# T4 dataset. Refocused on DENSIFICATION dynamics — analysis of recent runs
-# showed the population is essentially fully replaced during training
-# (13M spawns / 1.4M-4M final pop, 30% retention) with two big reset waves
-# wasting compute. The anti-phantom losses (lambda_occupancy /
-# lambda_front_acc / lambda_sky / lambda_stack) have been tuned and stay
-# at their configs/t4/exp_t4.yaml values for this sweep.
+# T4 dataset.
+#
+# Round-3 refocus. The first two iterations of this sweep (occupancy-loss
+# centric → densification-dynamics centric) settled the following structural
+# choices, which are now baked into configs/t4/exp_t4.yaml and held FIXED
+# for this sweep:
+#
+#   densify_until_num_points: 500_000   (per-asset bg cap; matches the
+#                                        ~470K actually-active count from
+#                                        the prior ckpt's view_count audit)
+#   opacity_reset_interval: 999999      (disabled — periodic α-reset waves
+#                                        wasted 3-4M prune/rebuild per cycle)
+#   thresh_opa_prune: 0.02              (bottom of bimodal opacity gap)
+#   densify_from_iter: 1500             (initial PCD seeds settle their α
+#                                        before clone/split adds candidates)
+#   dead_prune_enabled: true            (out-of-FOV phantom hard-prune;
+#                                        catches 60-78% inert mass)
+#   edge_depth_grad_thresh: 15          (Sobel threshold; visually tuned via
+#                                        visualize_edge_thresholds.py)
+#   edge_mask = sobel_edge | sky_boundary  (sky/no-return boundary is included
+#                                           — horizon ring is where phantoms
+#                                           collect, not where Sobel is noisy)
+#
+# What this sweep tunes
+# ---------------------
+# Five knobs grouped around the spawn-survival-suppress loop:
+#
+#   1. densify_grad_threshold     — spawn rate (the biggest churn lever)
+#   2. densify_until_iter         — densification window
+#   3. dead_prune_min_views       — minimum views to escape dead_prune
+#   4. edge_loss_boost            — strength of depth/front_acc edge amp
+#   5. lambda_stack               — direct phantom-suppression at edges
+#
+# Run 8wgqe7k4 finding that motivates this set: at peak (iter 12K) the
+# default grad_threshold=0.002 produced 69K spawn/cycle of which 48K (70%)
+# died the same cycle to dead_prune. The 500K cap held population in check
+# but ~70% of compute was wasted on Gaussians that never lived. The five
+# knobs above directly target that churn:
+#
+#   1 + 2  reduce spawn rate and shorten the spawn window
+#   3      raises survival bar so non-survivors die earlier
+#   4 + 5  push edge-aware losses harder (with the new edge_mask now
+#          covering sky boundaries, we have headroom to crank these up)
 #
 # Usage (from repo root):
-#   ./run_sweep_t4.sh --create
-#   ./run_sweep_t4.sh <SWEEP_ID>
-#
-# Each run is 20K iter with --disable_refine (refinement adds ~30 min
-# without affecting eval/total_phantom_pixels).
+#   ./run_sweep_t4.sh --create                 # prints SWEEP_ID
+#   ./run_sweep_t4.sh <SWEEP_ID> --parallel 3  # 3 agents on one GPU
 
 program: train.py
 method: bayes
 metric:
-  # Same metric as before: phantom-pixel aggregate over every train + eval
-  # frame on every sensor. Minimising this measures the densification
-  # quality (good geometry → few near-range phantoms), not just the
-  # phantom losses themselves.
+  # Aggregate "alpha rendered with no GT support" over every train + eval
+  # frame on every sensor. Direct phantom-count metric; doesn't conflate
+  # with mean-α-style proxies like occupancy_loss which can rise while
+  # phantom_pixels falls (8wgqe7k4 showed this divergence at iter 12-15K).
   name: eval/total_phantom_pixels
   goal: minimize
 
-# Bayes is sample-efficient at 5D; 30 runs gives a reasonable trend.
+# 30 Bayes runs over 5D is sample-efficient enough to find a good optimum.
+# With --parallel 3 on a single 24GB GPU, wall-clock ≈ 10-12 hours.
 run_cap: 30
 
 command:
@@ -41,44 +76,58 @@ command:
   - ${args}
 
 parameters:
-  # Densification spawn rate. The dominant knob — controls how many
-  # candidate Gaussians get clone/split each cycle. Current default 0.001
-  # halved spawn vs the old 0.0005; we want to find the value where
-  # eval/total_phantom_pixels is minimised without over-/under-fitting.
+  # ===== Spawn rate =====
+  # The single biggest churn lever. Default 0.003 was picked from the
+  # 8wgqe7k4 analysis (0.002 caused 70% same-cycle death). Log-uniform
+  # over ~5x range so Bayes can find the sweet spot in either direction.
   densify_grad_threshold:
     distribution: log_uniform_values
-    min: 0.0003
-    max: 0.005
+    min: 0.0015
+    max: 0.008
 
-  # Opacity reset waves. The biggest source of population churn — each
-  # reset clamps α≤0.01 and the next densify cycle prunes 1.5-3M
-  # Gaussians. 999999 = effectively disabled (the current default).
-  # The sweep can re-discover whether some reset is actually useful.
-  opacity_reset_interval:
-    values: [3000, 6000, 999999]
+  # ===== Densify window =====
+  # 8wgqe7k4 spawn explosion happened iter 10K-15K and contributed only
+  # ~22% useful Gaussians vs 78% wasted churn. Default 12K trims most
+  # of the tail; 10K is more aggressive, 15K reverts to the older
+  # behaviour for comparison.
+  densify_until_iter:
+    values: [10000, 12000, 15000]
 
-  # Per-asset population cap. After this many points, densify enters
-  # skip_densify=True (clone/split off, prune still on) for that asset.
-  # Lower → smaller stable model; higher → richer geometry but more cost.
-  densify_until_num_points:
-    values: [500000, 1000000, 1500000, 2000000]
+  # ===== Dead-Gaussian survival bar =====
+  # min_views=1 (current default) lets a Gaussian survive on a single
+  # frame's α·T > 0.001 over a 100-iter cycle — which is easy. Raising
+  # to 2 or 3 forces multi-view consistency and should attack churn at
+  # the survival side. Risk: legitimate Gaussians visible in only 1-2
+  # frames (rare occluded geometry, e.g. through-a-gap views) get
+  # mis-pruned. Sweep tells us which regime wins.
+  dead_prune_min_views:
+    values: [1, 2, 3]
 
-  # Opacity-based prune threshold. α below this gets pruned at every
-  # densify cycle. Aggressive (0.05) sheds borderline Gaussians fast;
-  # conservative (0.005) lets them recover.
-  thresh_opa_prune:
-    values: [0.005, 0.01, 0.02, 0.05]
+  # ===== Edge boost =====
+  # Multiplier on depth_l1 and front_acc at edge_mask pixels (final =
+  # 1 + edge_loss_boost). With edge_mask now ~25% of valid pixels
+  # (sobel_edge + sky_boundary, the latter explicitly targeting
+  # horizon-ring phantoms), we have headroom to push boost above 0.5
+  # without diluting the signal across half the image like the old
+  # 5.0/thr config did.
+  edge_loss_boost:
+    values: [0.3, 0.5, 1.0, 1.5]
 
-  # Iter at which densify_and_prune starts firing. Higher = more time
-  # for the initial PCD-seeded Gaussians to settle their α before
-  # clone/split adds more candidates (cuts the ~200K early-phase prunes
-  # observed in the iter 0-1000 window).
-  densify_from_iter:
-    values: [500, 1500, 3000]
+  # ===== Direct phantom suppression at edges =====
+  # stack_loss = (n_contributors_soft - 1).clamp_min(0).mean() on edge
+  # pixels — the "many thin Gaussians stacked at an edge" failure mode.
+  # Current default 0.05 is a placeholder; including 0.0 lets the sweep
+  # also test whether stack_loss adds value at all (vs the combination
+  # of edge-boosted depth/front_acc already covering the same pixels).
+  lambda_stack:
+    values: [0.0, 0.05, 0.1, 0.2]
 
 # Hyperband over eval/total_phantom_pixels — kills runs whose phantom
-# count stays high after the first couple of eval points (12K, 13K, ...).
+# count stays high after a couple of eval points. Raised min_iter from
+# 14K (prior config) to 15K because run 8wgqe7k4 showed a sharp eval-
+# phantom drop iter 13K → 15K (51K → 38K), so we want at least one
+# post-13K data point before culling.
 early_terminate:
   type: hyperband
-  min_iter: 14000     # let two eval points settle before culling
+  min_iter: 15000
   eta: 2
