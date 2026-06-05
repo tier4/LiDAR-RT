@@ -514,6 +514,18 @@ def training(args):
                     (gt_intensity * gt_mask).unsqueeze(0),
                 ).item()
 
+                # Phantom pixel count on the *current training frame* (cheap:
+                # reuses the main depth tensor instead of an extra render).
+                # Logged every iter rather than gated on visual_interval so we
+                # can watch the trend at fine granularity, especially around
+                # opacity_reset (3K, 6K, ...) where phantom counts can change
+                # sharply. The viz/* version stays as the fixed-frame variant
+                # for cross-iter visual comparison.
+                viz_min_depth_train = float(getattr(args, "viz_min_depth", 0.0))
+                with torch.no_grad():
+                    train_phantom_mask = (depth > 0) & (depth <= viz_min_depth_train)
+                    train_phantom_pixels = int(train_phantom_mask.sum().item())
+
                 wandb.log(
                     {
                         # Total losses
@@ -524,6 +536,8 @@ def training(args):
                         "train/depth_mse": depth_mse,
                         "train/depth_rmse": depth_rmse,
                         "train/depth_mae": depth_mae,
+                        # Near-range phantom pixel count (per current frame)
+                        "train/phantom_pixels": train_phantom_pixels,
                         # Intensity (weighted total + unweighted components)
                         "train/intensity_loss": loss_intensity.item(),
                         "train/intensity_l1": int_l1,
