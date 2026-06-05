@@ -1270,6 +1270,14 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_freespace", type=float, default=None)
     parser.add_argument("--lambda_front_acc", type=float, default=None)
     parser.add_argument("--lambda_sky", type=float, default=None)
+    # Densification / prune dynamics overrides — used by the
+    # densification-focused sweep yaml. Each falls back to the config
+    # value when not passed.
+    parser.add_argument("--densify_grad_threshold", type=float, default=None)
+    parser.add_argument("--opacity_reset_interval", type=int, default=None)
+    parser.add_argument("--densify_until_num_points", type=int, default=None)
+    parser.add_argument("--thresh_opa_prune", type=float, default=None)
+    parser.add_argument("--densify_from_iter", type=int, default=None)
     parser.add_argument("--exp_suffix", type=str, default="",
                         help="Append to exp_name (use to keep sweep run dirs distinct)")
     launch_args = parser.parse_args()
@@ -1290,6 +1298,12 @@ if __name__ == "__main__":
         "lambda_freespace": launch_args.lambda_freespace,
         "lambda_front_acc": launch_args.lambda_front_acc,
         "lambda_sky": launch_args.lambda_sky,
+        # Densification / prune dynamics
+        "densify_grad_threshold": launch_args.densify_grad_threshold,
+        "opacity_reset_interval": launch_args.opacity_reset_interval,
+        "densify_until_num_points": launch_args.densify_until_num_points,
+        "thresh_opa_prune": launch_args.thresh_opa_prune,
+        "densify_from_iter": launch_args.densify_from_iter,
     }
     for k, v in opt_overrides.items():
         if v is not None:

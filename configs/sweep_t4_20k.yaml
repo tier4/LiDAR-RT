@@ -1,36 +1,31 @@
 # Wandb sweep config for 20K-iteration hyperparameter search on the default
-# T4 dataset. Tunes the 3D occupancy loss (lambda / voxel size / warmup) plus
-# the two cooperating phantom losses (sky transparency, free-space). Other
-# params (depth/intensity/raydrop weights, densification schedule) stay at
-# the values in configs/t4/exp_t4.yaml so the sweep isolates the
-# anti-phantom signal.
+# T4 dataset. Refocused on DENSIFICATION dynamics — analysis of recent runs
+# showed the population is essentially fully replaced during training
+# (13M spawns / 1.4M-4M final pop, 30% retention) with two big reset waves
+# wasting compute. The anti-phantom losses (lambda_occupancy /
+# lambda_front_acc / lambda_sky / lambda_stack) have been tuned and stay
+# at their configs/t4/exp_t4.yaml values for this sweep.
 #
 # Usage (from repo root):
-#   wandb sweep --project LiDAR-RT-debug --entity advanced-technology-department configs/sweep_t4_20k.yaml
-#   wandb agent <entity>/<project>/<SWEEP_ID>     # paste the ID printed above
+#   ./run_sweep_t4.sh --create
+#   ./run_sweep_t4.sh <SWEEP_ID>
 #
-# Or via the launcher: ./run_sweep_t4.sh --create / ./run_sweep_t4.sh <SWEEP_ID>
-#
-# Each run uses --disable_refine to skip the post-training UNet stage
-# (≈30 min / run that contributes nothing to the metric we tune for here).
+# Each run is 20K iter with --disable_refine (refinement adds ~30 min
+# without affecting eval/total_phantom_pixels).
 
 program: train.py
 method: bayes
 metric:
-  # Phantom-pixel aggregate over every train + eval frame on every sensor.
-  # Minimising this directly drives the anti-phantom losses to suppress
-  # near-range (rendered_depth <= viz_min_depth) hits everywhere, not just
-  # on a single viz frame. eval/mix_metric remains logged for reference
-  # but is no longer the sweep target — minimising phantoms while keeping
-  # mix_metric high is the joint goal here.
+  # Same metric as before: phantom-pixel aggregate over every train + eval
+  # frame on every sensor. Minimising this measures the densification
+  # quality (good geometry → few near-range phantoms), not just the
+  # phantom losses themselves.
   name: eval/total_phantom_pixels
   goal: minimize
 
-# Cap the agent so a runaway sweep doesn't burn the GPU forever. Override
-# with `--count` to wandb agent if you want more/fewer.
+# Bayes is sample-efficient at 5D; 30 runs gives a reasonable trend.
 run_cap: 30
 
-# `${args}` appends each sampled hyperparameter as `--key=value`.
 command:
   - ${env}
   - python
@@ -46,35 +41,44 @@ command:
   - ${args}
 
 parameters:
-  # Occupancy loss — primary focus of this sweep.
-  lambda_occupancy:
+  # Densification spawn rate. The dominant knob — controls how many
+  # candidate Gaussians get clone/split each cycle. Current default 0.001
+  # halved spawn vs the old 0.0005; we want to find the value where
+  # eval/total_phantom_pixels is minimised without over-/under-fitting.
+  densify_grad_threshold:
     distribution: log_uniform_values
-    min: 0.01
-    max: 0.5
-  occupancy_voxel_size:
-    values: [0.05, 0.1, 0.2, 0.3, 0.5]
-  occupancy_warmup_iter:
-    values: [1000, 3000, 5000, 10000]
+    min: 0.0003
+    max: 0.005
 
-  # Co-tuned with occupancy because all three target the same phantom-Gaussian
-  # failure mode; their best joint point likely shifts when one of them moves.
-  # Note: lambda_freespace is now off by default (replaced by lambda_front_acc
-  # which covers sky rays too via the target_depth = ∞ sentinel). Sweep just
-  # the front-acc weight here.
-  lambda_front_acc:
-    distribution: log_uniform_values
-    min: 0.01
-    max: 0.2
-  lambda_sky:
-    distribution: log_uniform_values
-    min: 0.005
-    max: 0.1
+  # Opacity reset waves. The biggest source of population churn — each
+  # reset clamps α≤0.01 and the next densify cycle prunes 1.5-3M
+  # Gaussians. 999999 = effectively disabled (the current default).
+  # The sweep can re-discover whether some reset is actually useful.
+  opacity_reset_interval:
+    values: [3000, 6000, 999999]
 
-# Bayesian sweeps prune unpromising runs early when early_terminate is set.
-# Hyperband over eval/total_phantom_pixels (logged 12K → 20K each 1K iter,
-# higher = worse for our minimisation goal so hyperband culls the runs with
-# stubborn phantoms after a couple of eval points).
+  # Per-asset population cap. After this many points, densify enters
+  # skip_densify=True (clone/split off, prune still on) for that asset.
+  # Lower → smaller stable model; higher → richer geometry but more cost.
+  densify_until_num_points:
+    values: [500000, 1000000, 1500000, 2000000]
+
+  # Opacity-based prune threshold. α below this gets pruned at every
+  # densify cycle. Aggressive (0.05) sheds borderline Gaussians fast;
+  # conservative (0.005) lets them recover.
+  thresh_opa_prune:
+    values: [0.005, 0.01, 0.02, 0.05]
+
+  # Iter at which densify_and_prune starts firing. Higher = more time
+  # for the initial PCD-seeded Gaussians to settle their α before
+  # clone/split adds more candidates (cuts the ~200K early-phase prunes
+  # observed in the iter 0-1000 window).
+  densify_from_iter:
+    values: [500, 1500, 3000]
+
+# Hyperband over eval/total_phantom_pixels — kills runs whose phantom
+# count stays high after the first couple of eval points (12K, 13K, ...).
 early_terminate:
   type: hyperband
-  min_iter: 14000     # don't kill before two eval points are in
+  min_iter: 14000     # let two eval points settle before culling
   eta: 2
