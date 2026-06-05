@@ -300,20 +300,27 @@ def training(args):
         H, W = depth.shape[0], depth.shape[1]
 
         # === GT-depth edge mask ===
-        # Detect pixels where the GT depth has a strong spatial discontinuity
-        # (= adjacent pixels look at very different surfaces). These are
-        # exactly where the model is tempted to fill the gap with a sheet
-        # of thin phantom Gaussians. Boost depth/front-acc losses on these
-        # pixels so the local-minimum solution costs more than the correct
-        # single-surface solution.
+        # Phantom Gaussians concentrate at two distinct kinds of edges:
+        #   (A) Geometric depth discontinuities — adjacent pixels look at
+        #       very different surfaces (e.g. a car silhouetted against a
+        #       building 20m behind it). Captured by a Sobel-magnitude
+        #       threshold on gt_depth, restricted to fully-valid 3x3
+        #       neighbourhoods (Sobel becomes meaningless if any neighbour
+        #       has no return — depth=0 sentinel creates a fake jump).
+        #   (B) No-return boundaries — valid pixels adjacent to invalid
+        #       (sky/missing return). The horizon ring against sky and the
+        #       upper edges of buildings/trees fall here. Sobel can't see
+        #       these, but they're the single largest phantom-collection
+        #       region in the T4 / Hesai OT128 scenes; the edge-aware
+        #       losses must cover them too.
+        # The edge_mask is the UNION (A) ∪ (B). Boosts depth/front-acc
+        # losses and gates stack_loss so the local-minimum "stacked thin
+        # phantoms" solution costs more than the correct single-surface one.
         gt_depth = cur_lidar.get_depth(frame).cuda()
         edge_grad_thresh = float(getattr(args.opt, "edge_depth_grad_thresh", 0.0))
         edge_loss_boost = float(getattr(args.opt, "edge_loss_boost", 0.0))
         if edge_grad_thresh > 0 and edge_loss_boost > 0:
             with torch.no_grad():
-                # Both-side validity: only call a gradient an "edge" if both
-                # neighbours had a valid GT return — otherwise the gradient
-                # is a no-return / return boundary, not a true geometric edge.
                 gt_d = gt_depth.unsqueeze(0).unsqueeze(0)
                 # Sobel via fixed conv2d kernels (allocated once would be
                 # nicer, but the cost is negligible vs the rendering).
@@ -323,11 +330,14 @@ def training(args):
                 gx = F.conv2d(gt_d, sx, padding=1).squeeze()
                 gy = F.conv2d(gt_d, sy, padding=1).squeeze()
                 edge_mag = torch.sqrt(gx * gx + gy * gy)
-                # Suppress edges where any pixel in the 3x3 neighbourhood was
-                # invalid (= no LiDAR return). max_pool of ~gt_mask catches this.
                 invalid = (~gt_mask).float().unsqueeze(0).unsqueeze(0)
                 any_invalid = F.max_pool2d(invalid, 3, stride=1, padding=1).squeeze() > 0.5
-                edge_mask = (edge_mag > edge_grad_thresh) & ~any_invalid & gt_mask
+                # (A) Sobel geometric edges, both-side-valid only.
+                sobel_edge = (edge_mag > edge_grad_thresh) & ~any_invalid & gt_mask
+                # (B) Sky / no-return boundary: valid pixels with at least
+                # one invalid neighbour. Independent of any depth value.
+                sky_boundary = any_invalid & gt_mask
+                edge_mask = sobel_edge | sky_boundary
             edge_weight = 1.0 + edge_loss_boost * edge_mask.float()
         else:
             edge_mask = torch.zeros_like(gt_mask, dtype=torch.bool)

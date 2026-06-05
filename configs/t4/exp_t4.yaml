@@ -102,7 +102,21 @@ opt:
   # the depth gap with a sheet of thin phantom Gaussians ("stacked
   # phantom" pattern at horizon ring and ground edges). Off when either
   # threshold or boost is 0.
-  edge_depth_grad_thresh: 5.0   # m/pixel; below this the pixel isn't an edge
+  edge_depth_grad_thresh: 15.0  # Sobel magnitude threshold (m/pixel) for the
+                                # geometric-edge half of edge_mask. Was 5.0,
+                                # which caught ~32% of valid pixels (every
+                                # ground-plane slope qualified — Sobel kernel
+                                # peak ≈ 4 × per-pixel depth jump, so thr=5
+                                # catches steps as small as 1.25m/pixel).
+                                # Empirical visualization (see
+                                # visualize_edge_thresholds.py) shows 15
+                                # cleans up ground noise while keeping
+                                # building/tree object boundaries. Combined
+                                # with the new sky-boundary union (any
+                                # valid pixel adjacent to no-return),
+                                # final edge_mask covers ~25% of valid
+                                # pixels and specifically targets phantom
+                                # collection regions.
   edge_loss_boost: 0.5          # added on top of 1.0 → edge pixels get 1.5x.
                                 # Higher values amplify the depth gradient at
                                 # edges → drives extra densification there
