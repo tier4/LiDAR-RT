@@ -37,7 +37,16 @@ opt:
                                    # before clone/split adds more candidates.
                                    # Cuts the iter 0-1000 churn observed
                                    # in the last run (~200K early prunes).
-  densify_until_iter: 15_000
+  densify_until_iter: 12_000   # Was 15_000. wandb run 8wgqe7k4 analysis: spawn
+                               # exploded iter 10K-15K (cumulative clone went
+                               # 212K → 694K per 1000-iter window, while
+                               # dead_prune killed 48K/cycle out of 69K
+                               # spawn/cycle = 70% immediate-death churn).
+                               # Cap the densify window at 12K to skip that
+                               # waste phase. The cap-saturated bg (500K) is
+                               # mostly built by iter 11K and the eval phantom
+                               # was already 49K → 38K by iter 15K mostly via
+                               # restructuring, not new spawns.
   densify_until_num_points: 500_000    # Was 2M, then 1M. Render-sweep analysis
                                        # showed only 22% of bg (470K of 2.13M)
                                        # accumulated any weight across all train
@@ -52,21 +61,19 @@ opt:
 
   densify_use_absgrads: False
   densify_scale_threshold: 0.0002
-  densify_grad_threshold: 0.002   # Was 0.001 (and 0.0005 before). Halved spawn
-                                  # rate. Combined with 500K cap above and the
-                                  # dead_prune, expected steady-state spawn/
-                                  # prune cumulative drops 3-4x from the prior
-                                  # run's 12M/10M, and final pop lands near
-                                  # 300-500K bg — close to the 470K we measured
-                                  # as actually active in the prior ckpt. With reset
-                                  # disabled and a 1M cap, the model needs
-                                  # to be more selective about WHICH high-
-                                  # gradient pixels actually warrant a new
-                                  # Gaussian. 2x raise from prior setting
-                                  # halves spawn rate to ~400/iter (was
-                                  # 825/iter), and combined with the cap
-                                  # gives a sustainable 2-2.5M steady-state
-                                  # population.
+  densify_grad_threshold: 0.003   # Was 0.002 (then 0.001 / 0.0005). wandb run
+                                  # 8wgqe7k4 showed extreme churn at the 0.002
+                                  # setting — peak iter 12K had 69K spawn/cycle
+                                  # of which 48K (70%) were immediately killed
+                                  # by dead_prune the same cycle. Raising the
+                                  # gradient bar to 0.003 cuts spawn rate by
+                                  # ~50% so the model only proposes Gaussians
+                                  # at pixels with substantial residual error,
+                                  # not every weak signal. Combined with the
+                                  # densify_until_iter cut to 12K above and the
+                                  # 500K bg cap, expected per-cycle: 30-35K
+                                  # spawn, 10-15K dead, 20K net survivor —
+                                  # ~3x less computational waste than before.
   densify_weight_threshold: 0.0
   prune_size_threshold: 0.1
   thresh_opa_prune: 0.02   # Was 0.001 — bg ckpt analysis showed ~55% of
