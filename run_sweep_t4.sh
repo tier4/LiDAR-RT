@@ -4,13 +4,19 @@
 # Workflow:
 #   1. Create the sweep on wandb (gets a SWEEP_ID printed):
 #        ./run_sweep_t4.sh --create
-#   2. On any GPU host (can run multiple agents in parallel against the same
-#      sweep), start an agent:
+#   2. On any GPU host, start an agent (or several):
 #        ./run_sweep_t4.sh <SWEEP_ID>
-#      Optional: pass --gpu N to pin to a specific CUDA device.
-#      Optional: pass --count N to limit the number of runs this agent does
-#      before exiting (default: keep running until the sweep is exhausted or
-#      run_cap from the yaml is hit).
+#      Optional flags:
+#        --gpu N        pin to a specific CUDA device
+#        --count N      stop this agent after N runs (default: until sweep
+#                       exhausts or run_cap from the yaml is hit)
+#        --parallel N   launch N concurrent agent processes on the same
+#                       GPU. Use this when one run only takes ~3GB so a
+#                       single 24GB GPU can host 3-4 in parallel. The
+#                       script forwards Ctrl+C / SIGTERM to all children.
+#                       (train.py auto-suffixes the output dir with the
+#                       wandb run id under WANDB_RUN_ID so parallel runs
+#                       don't trample each other's checkpoints.)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,9 +27,9 @@ PROJECT="LiDAR-RT-debug"
 usage() {
     cat <<EOF
 Usage:
-  $0 --create                              Create a new sweep, print its SWEEP_ID
-  $0 <SWEEP_ID> [--gpu N] [--count N]      Run an agent for the given sweep
-  $0 --resume <SWEEP_ID> [--gpu N]         Alias for the run-agent form
+  $0 --create                                       Create a new sweep, print its SWEEP_ID
+  $0 <SWEEP_ID> [--gpu N] [--count N] [--parallel N] Run an agent for the given sweep
+  $0 --resume <SWEEP_ID> [--gpu N] [--parallel N]   Alias for the run-agent form
 
 Environment:
   WANDB_ENTITY   defaults to "${ENTITY}"
@@ -43,7 +49,7 @@ if [ "$1" = "--create" ]; then
         "${SWEEP_CONFIG}"
     echo ""
     echo "Copy the SWEEP_ID printed above, then start an agent:"
-    echo "  $0 <SWEEP_ID> [--gpu 0] [--count 10]"
+    echo "  $0 <SWEEP_ID> [--gpu 0] [--count 10] [--parallel 3]"
     exit 0
 fi
 
@@ -56,6 +62,7 @@ shift
 
 GPU_FLAG=""
 COUNT_FLAG=""
+PARALLEL=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --gpu)
@@ -69,6 +76,15 @@ while [ $# -gt 0 ]; do
             COUNT_FLAG="--count $2"
             shift 2
             ;;
+        --parallel)
+            [ $# -lt 2 ] && { echo "Error: --parallel requires a value"; usage; }
+            PARALLEL="$2"
+            if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]] || [ "$PARALLEL" -lt 1 ]; then
+                echo "Error: --parallel must be a positive integer"
+                exit 1
+            fi
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             usage
@@ -76,6 +92,48 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-echo "Starting wandb agent for sweep ${SWEEP_ID} ${GPU_FLAG}"
 cd "${SCRIPT_DIR}"
-exec wandb agent ${COUNT_FLAG} "${WANDB_ENTITY:-${ENTITY}}/${WANDB_PROJECT:-${PROJECT}}/${SWEEP_ID}"
+AGENT_URI="${WANDB_ENTITY:-${ENTITY}}/${WANDB_PROJECT:-${PROJECT}}/${SWEEP_ID}"
+
+if [ "$PARALLEL" -eq 1 ]; then
+    echo "Starting wandb agent for sweep ${SWEEP_ID} ${GPU_FLAG}"
+    exec wandb agent ${COUNT_FLAG} "${AGENT_URI}"
+fi
+
+# Parallel: launch N agents in the background, forward signals.
+echo "Starting ${PARALLEL} parallel wandb agents for sweep ${SWEEP_ID} ${GPU_FLAG}"
+echo "  (each agent runs as its own process on the same GPU;"
+echo "   train.py auto-suffixes output dirs with WANDB_RUN_ID)"
+
+LOG_DIR="${SCRIPT_DIR}/output/sweep_agent_logs"
+mkdir -p "${LOG_DIR}"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+CHILD_PIDS=()
+cleanup() {
+    echo ""
+    echo "Forwarding signal to ${#CHILD_PIDS[@]} agent(s)..."
+    for pid in "${CHILD_PIDS[@]}"; do
+        kill "${pid}" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    exit 0
+}
+trap cleanup INT TERM
+
+for i in $(seq 1 "${PARALLEL}"); do
+    LOG_FILE="${LOG_DIR}/agent_${TS}_${i}.log"
+    echo "  agent ${i}/${PARALLEL} -> ${LOG_FILE}"
+    wandb agent ${COUNT_FLAG} "${AGENT_URI}" >"${LOG_FILE}" 2>&1 &
+    CHILD_PIDS+=($!)
+    # Stagger startup so the OccupancyGrid cache (rebuilt on cache miss) is
+    # produced by exactly one process; the others wait, find it, and load.
+    if [ "$i" -lt "${PARALLEL}" ]; then
+        sleep 5
+    fi
+done
+
+echo "All ${PARALLEL} agents launched. PIDs: ${CHILD_PIDS[*]}"
+echo "Tail any agent log with:  tail -f ${LOG_DIR}/agent_${TS}_<i>.log"
+echo "Stop everything with Ctrl+C in this terminal."
+wait

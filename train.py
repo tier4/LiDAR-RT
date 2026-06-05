@@ -1331,6 +1331,13 @@ if __name__ == "__main__":
     if launch_args.exp_suffix:
         args.exp_name = f"{args.exp_name}_{launch_args.exp_suffix}"
         print(f"[override] args.exp_name = {args.exp_name}")
+    elif os.environ.get("WANDB_RUN_ID"):
+        # Running under a wandb agent (sweep). Auto-suffix the output dir
+        # with the wandb run id so parallel sweep agents writing into the
+        # same model_dir don't trample each other's saved checkpoints /
+        # rendered images / logs/log.json.
+        args.exp_name = f"{args.exp_name}_{os.environ['WANDB_RUN_ID']}"
+        print(f"[override] args.exp_name = {args.exp_name} (auto WANDB_RUN_ID)")
 
     if launch_args.gpu is not None:
         if not torch.cuda.is_available():
