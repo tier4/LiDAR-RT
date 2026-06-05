@@ -861,6 +861,35 @@ def training(args):
                             mix_metric += psnr_depth + psnr_intensity
                             eval_count += 1
                     mix_metric /= max(eval_count, 1)
+
+                    # All-frame phantom pixel count: aggregates near-range
+                    # phantoms (0 < rendered_depth <= viz_min_depth) across
+                    # every train + eval frame on every sensor, summed and
+                    # ratio'd against total pixel count. Used as the sweep
+                    # optimization target (minimize). Re-renders each frame
+                    # at the current model state (~50 frames × ≤10s wall-
+                    # clock per eval) so it's an honest measure rather than
+                    # the per-iter single-frame proxy.
+                    total_phantom_pixels = 0
+                    total_pixel_count = 0
+                    viz_min_depth_eval = float(getattr(args, "viz_min_depth", 0.0))
+                    with torch.no_grad():
+                        for sname_p, lidar_p in scene.train_lidars.items():
+                            frames_p = sorted(
+                                set(lidar_p.train_frames) | set(lidar_p.eval_frames)
+                            )
+                            for fid_p in frames_p:
+                                render_pkg_p = raytracing(
+                                    fid_p, gaussians_assets, lidar_p,
+                                    background, args,
+                                )
+                                d_p = render_pkg_p["depth"].squeeze(-1)
+                                phantom_p = (d_p > 0) & (d_p <= viz_min_depth_eval)
+                                total_phantom_pixels += int(phantom_p.sum().item())
+                                total_pixel_count += int(d_p.numel())
+                    total_phantom_ratio = (total_phantom_pixels
+                                           / max(total_pixel_count, 1))
+
                     if WANDB_FOUND:
                         wandb.log(
                             {
@@ -869,6 +898,9 @@ def training(args):
                                 "eval/depth_rmse": eval_depth_rmse_sum / max(eval_count, 1),
                                 "eval/psnr_depth": eval_psnr_depth_sum / max(eval_count, 1),
                                 "eval/psnr_intensity": eval_psnr_intensity_sum / max(eval_count, 1),
+                                # All-frame phantom aggregate — sweep target.
+                                "eval/total_phantom_pixels": total_phantom_pixels,
+                                "eval/total_phantom_ratio": total_phantom_ratio,
                             },
                             step=iteration,
                         )

@@ -17,8 +17,14 @@
 program: train.py
 method: bayes
 metric:
-  name: eval/mix_metric    # PSNR_depth + PSNR_intensity averaged over eval frames
-  goal: maximize
+  # Phantom-pixel aggregate over every train + eval frame on every sensor.
+  # Minimising this directly drives the anti-phantom losses to suppress
+  # near-range (rendered_depth <= viz_min_depth) hits everywhere, not just
+  # on a single viz frame. eval/mix_metric remains logged for reference
+  # but is no longer the sweep target — minimising phantoms while keeping
+  # mix_metric high is the joint goal here.
+  name: eval/total_phantom_pixels
+  goal: minimize
 
 # Cap the agent so a runaway sweep doesn't burn the GPU forever. Override
 # with `--count` to wandb agent if you want more/fewer.
@@ -46,7 +52,7 @@ parameters:
     min: 0.01
     max: 0.5
   occupancy_voxel_size:
-    values: [0.3, 0.5, 0.7, 1.0]
+    values: [0.05, 0.1, 0.2, 0.3, 0.5]
   occupancy_warmup_iter:
     values: [1000, 3000, 5000, 10000]
 
@@ -65,7 +71,9 @@ parameters:
     max: 0.1
 
 # Bayesian sweeps prune unpromising runs early when early_terminate is set.
-# Hyperband over the eval/mix_metric ramp (12K → 20K, logged each 1K iter).
+# Hyperband over eval/total_phantom_pixels (logged 12K → 20K each 1K iter,
+# higher = worse for our minimisation goal so hyperband culls the runs with
+# stubborn phantoms after a couple of eval points).
 early_terminate:
   type: hyperband
   min_iter: 14000     # don't kill before two eval points are in
