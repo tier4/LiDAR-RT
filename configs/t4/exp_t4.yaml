@@ -21,14 +21,23 @@ opt:
   position_lr_max_steps: 30_000
 
   densification_interval: 100
-  opacity_reset_interval: 3000
+  opacity_reset_interval: 6000   # Was 3000. Each reset clamps α≤0.01 so the
+                                 # next densify cycle prunes 1.5-2.7M Gaussians
+                                 # ("junk wave"). Halving the frequency cuts
+                                 # cumulative churn ~50% and lets pop stabilise.
   densify_from_iter: 500
   densify_until_iter: 15_000
   densify_until_num_points: 2_000_000
 
   densify_use_absgrads: False
   densify_scale_threshold: 0.0002
-  densify_grad_threshold: 0.0002
+  densify_grad_threshold: 0.0005  # Was 0.0002. T4 urban scenes have high-
+                                  # gradient pixels everywhere (edges, horizon,
+                                  # textures); low threshold spawned ~15M
+                                  # clones/12K iter of which 90% died short.
+                                  # 2.5x reduces spurious densify; the edge-
+                                  # phantom side is now handled by stack_loss
+                                  # + front_acc rather than over-densification.
   densify_weight_threshold: 0.0
   prune_size_threshold: 0.1
   thresh_opa_prune: 0.02   # Was 0.001 — bg ckpt analysis showed ~55% of
