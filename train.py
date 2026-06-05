@@ -91,6 +91,7 @@ def training(args):
         "prune_aniso_sum": [],
         "prune_front_sum": [],
         "prune_occ_sum": [],
+        "prune_dead_sum": [],
     }
     scene_id = str(args.scene_id) if isinstance(args.scene_id, int) else args.scene_id
     output_dir = os.path.join(
@@ -570,6 +571,11 @@ def training(args):
                 if log.get("prune_occ_sum")
                 else densify_info[7]
             )
+            prune_dead_sum = (
+                densify_info[8] + log["prune_dead_sum"][-1]
+                if log.get("prune_dead_sum")
+                else densify_info[8]
+            )
             log["depth_mse"].append(depth_mse)
             log["points_num"].append(points_num)
             log["clone_sum"].append(clone_sum)
@@ -580,6 +586,7 @@ def training(args):
             log.setdefault("prune_aniso_sum", []).append(prune_aniso_sum)
             log.setdefault("prune_front_sum", []).append(prune_front_sum)
             log.setdefault("prune_occ_sum", []).append(prune_occ_sum)
+            log.setdefault("prune_dead_sum", []).append(prune_dead_sum)
 
             # prepare loss stats for tensorboard record
             loss_stats = {
@@ -675,6 +682,7 @@ def training(args):
                         "train/prune_aniso_sum": prune_aniso_sum,
                         "train/prune_front_sum": prune_front_sum,
                         "train/prune_occ_sum": prune_occ_sum,
+                        "train/prune_dead_sum": prune_dead_sum,
                         # Learning rate
                         "train/lr_xyz": gaussians_assets[0].optimizer.param_groups[0]["lr"],
                     },

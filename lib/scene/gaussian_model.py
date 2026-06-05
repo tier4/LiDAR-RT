@@ -404,11 +404,37 @@ class GaussianModel:
                           front_prune_min_views=3,
                           occupancy_grid=None,
                           occupancy_prune_enabled=False,
-                          occupancy_prune_opacity_threshold=0.5):
+                          occupancy_prune_opacity_threshold=0.5,
+                          dead_prune_enabled=False,
+                          dead_prune_min_views=1):
         # When skip_densify is True, we run only the pruning steps below
         # (low-opacity, bbox-escape, min_range_prune, big-points). This lets
         # us keep cleaning up after an asset has hit its point cap, instead
         # of freezing both densification AND pruning the moment we cross it.
+
+        # --- Dead-Gaussian hard prune (runs FIRST, before clone/split). ---
+        # A Gaussian whose view_count stayed below the threshold over an
+        # entire densification cycle (~100 iter) was never crossed by any
+        # training ray with meaningful contribution — invisible from every
+        # viewpoint. Analysis of trained ckpts showed this class accounts
+        # for 60% (Waymo) to 78% (T4) of bg, with α drifted to 1.0 and no
+        # other prune mechanism able to catch them. Running this BEFORE
+        # clone/split avoids confusing fresh spawns (view_count=0 by
+        # construction) with truly-dead Gaussians. After the prune, the
+        # rest of the densify/prune flow proceeds on the survivors.
+        prune_dead_num = 0
+        if (dead_prune_enabled and self.view_count.numel() > 0
+                and self.get_local_xyz.shape[0] > 0):
+            vc = self.view_count.squeeze(-1)
+            dead_mask = vc < dead_prune_min_views
+            n_dead = int(dead_mask.sum().item())
+            n_pre = self.get_local_xyz.shape[0]
+            if 0 < n_dead < n_pre:
+                self.prune_points(dead_mask)
+                prune_dead_num = n_dead
+                print(f'Hard prune dead Gaussians (view_count<{dead_prune_min_views}): '
+                      f'{n_dead}/{n_pre}')
+
         mean_grads = (self.xyz_gradient_accum / self.denom).nan_to_num(0.0).squeeze(-1)
 
         if skip_densify:
@@ -609,7 +635,8 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
-                prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num)
+                prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num,
+                prune_dead_num)
 
     def add_densification_stats(self, mean_grads, update_filter):
         self.xyz_gradient_accum += torch.norm(mean_grads, dim=-1, keepdim=True)

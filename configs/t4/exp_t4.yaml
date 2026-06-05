@@ -120,6 +120,21 @@ opt:
   # opacity exceeds threshold — definitionally a phantom (LiDAR never
   # returned there, yet it's rendering visibly). Reuses the same
   # OccupancyGrid the soft loss builds at startup.
+  # Dead-Gaussian hard prune (bg only). Targets the structural failure
+  # mode where densify spawns Gaussians at positions outside the LiDAR's
+  # reachable cone — they never receive a ray hit, get no gradient, drift
+  # α to 1.0 unchecked, and escape every other prune mechanism. A
+  # render-sweep analysis showed 60% (Waymo) to 78% (T4) of bg in this
+  # state. We track view_count (already used by sky_prune / front_prune)
+  # across each ~100-iter densify cycle and prune any bg Gaussian with
+  # view_count < min_views (= never observed). Runs FIRST in
+  # densify_and_prune so fresh clone/split spawns (vc=0 by construction)
+  # aren't mistakenly culled.
+  dead_prune_enabled: true
+  dead_prune_warmup_iter: 3000     # let densify settle before the first sweep
+  dead_prune_min_views: 1          # 0 observations across the cycle → kill
+  dead_prune_min_contrib: 0.001    # per-frame α·T threshold to count as "observed"
+
   occupancy_prune_enabled: false  # Disabled in favour of edge_loss_boost + lambda_stack
                                   # which target edge phantoms at the source (densification)
                                   # rather than removing them after the fact. Re-enable as

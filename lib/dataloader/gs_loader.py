@@ -310,7 +310,7 @@ class SceneLidar(Scene):
         occupancy_grid=None,
     ):
 
-        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num = 0, 0, 0, 0, 0, 0, 0, 0
+        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num, prune_dead_num = 0, 0, 0, 0, 0, 0, 0, 0, 0
 
         sky_prune_enabled_global = bool(getattr(args.opt, "sky_prune_enabled", False))
         sky_prune_warmup_iter = int(getattr(args.opt, "sky_prune_warmup_iter", 0))
@@ -335,6 +335,11 @@ class SceneLidar(Scene):
         occupancy_prune_warmup_iter = int(getattr(args.opt, "occupancy_prune_warmup_iter", 0))
         occupancy_prune_opacity_threshold = float(getattr(args.opt, "occupancy_prune_opacity_threshold", 0.5))
 
+        dead_prune_enabled_global = bool(getattr(args.opt, "dead_prune_enabled", False))
+        dead_prune_warmup_iter = int(getattr(args.opt, "dead_prune_warmup_iter", 0))
+        dead_prune_min_views = int(getattr(args.opt, "dead_prune_min_views", 1))
+        dead_prune_min_contrib = float(getattr(args.opt, "dead_prune_min_contrib", 1e-3))
+
         begin_index = 0
         for gaussians in self.gaussians_assets:
             points_num = gaussians.get_local_xyz.shape[0]
@@ -354,13 +359,21 @@ class SceneLidar(Scene):
                                   and front_prune_enabled_global
                                   and gaussians.bounding_box is None
                                   and iteration >= front_prune_warmup_iter)
-            if asset_sky_active or asset_front_active:
+            asset_dead_active = (dead_prune_enabled_global
+                                 and gaussians.bounding_box is None
+                                 and iteration >= dead_prune_warmup_iter)
+            if asset_sky_active or asset_front_active or asset_dead_active:
                 instance_total = accum_weights[begin_index : begin_index + points_num]
                 # Shared denominator: bump view_count once per active view.
                 # min_total_contrib uses whichever sub-stat is active (they
                 # should agree; both default to 1e-3).
-                bump_thresh = (sky_min_total_contrib if asset_sky_active
-                               else front_min_total_contrib)
+                # Pick the smallest active threshold so view_count bumps for
+                # anything any active prune mechanism would consider "observed".
+                bump_candidates = []
+                if asset_sky_active:    bump_candidates.append(sky_min_total_contrib)
+                if asset_front_active:  bump_candidates.append(front_min_total_contrib)
+                if asset_dead_active:   bump_candidates.append(dead_prune_min_contrib)
+                bump_thresh = min(bump_candidates) if bump_candidates else 1e-3
                 gaussians.add_view_count(instance_total,
                                          min_total_contrib=bump_thresh)
                 if asset_sky_active:
@@ -434,6 +447,11 @@ class SceneLidar(Scene):
                         and iteration >= occupancy_prune_warmup_iter
                         and occupancy_grid is not None
                     )
+                    asset_dead_prune_enabled = (
+                        dead_prune_enabled_global
+                        and gaussians.bounding_box is None
+                        and iteration >= dead_prune_warmup_iter
+                    )
                     densify_info = gaussians.densify_and_prune(
                         args.opt, 0.005, size_threshold,
                         sensor_centers=sensor_centers,
@@ -451,6 +469,8 @@ class SceneLidar(Scene):
                         occupancy_grid=occupancy_grid if asset_occupancy_prune_enabled else None,
                         occupancy_prune_enabled=asset_occupancy_prune_enabled,
                         occupancy_prune_opacity_threshold=occupancy_prune_opacity_threshold,
+                        dead_prune_enabled=asset_dead_prune_enabled,
+                        dead_prune_min_views=dead_prune_min_views,
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
@@ -460,6 +480,7 @@ class SceneLidar(Scene):
                     prune_aniso_num += densify_info[5]
                     prune_front_num += densify_info[6]
                     prune_occ_num += densify_info[7]
+                    prune_dead_num += densify_info[8]
 
                 if iteration % args.opt.opacity_reset_interval == 0 or (
                     args.model.white_background
@@ -485,4 +506,5 @@ class SceneLidar(Scene):
                     gaussians._scaling.data.clamp_(min=math.log(min_scale))
 
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
-                prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num)
+                prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num,
+                prune_dead_num)
