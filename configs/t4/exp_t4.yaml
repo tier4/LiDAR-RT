@@ -31,7 +31,13 @@ opt:
   densify_grad_threshold: 0.0002
   densify_weight_threshold: 0.0
   prune_size_threshold: 0.1
-  thresh_opa_prune: 0.001
+  thresh_opa_prune: 0.02   # Was 0.001 — bg ckpt analysis showed ~55% of
+                           # Gaussians sat at α < 0.05 (median 0.024) as
+                           # barely-rendering fluff that escaped the old
+                           # threshold. 0.02 lands at the bottom of the
+                           # bimodal opacity gap (p50 of bg = 0.024) so
+                           # fluff gets killed while moderate-α Gaussians
+                           # (0.05-0.3) survive.
   min_scale: 1.0e-6   # Lower bound on σ=exp(_scaling) applied every Adam step;
                       # prevents OptiX EXCESSIVE_DEGENERATE_PRIMITIVES warnings
                       # caused by post-densify scale drift. 0 disables.
