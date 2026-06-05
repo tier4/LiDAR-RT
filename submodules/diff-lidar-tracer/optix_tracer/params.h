@@ -71,7 +71,20 @@ struct Params
     // concentrates in sky pixels across many views.
     float* pixel_weight;
     float* accum_gaussian_sky_weights;
-    
+
+    // Optional per-pixel target_depth (H, W) and per-pixel "accumulated alpha
+    // up to target_depth" output (H, W). When target_depth is non-null, the
+    // kernel records W_target = sum over hits where dpt < target_depth[tidx]
+    // of alpha*T. Used by the front-side accumulation loss: rays where GT
+    // returned a hit at gt_depth should have W_target ≈ 0 because no surface
+    // should exist in front of the real hit. Sky rays pass target_depth =
+    // large sentinel so W_target == total W (subsumes the older freespace
+    // loss). Pass nullptr for both to skip the snapshot path entirely.
+    float* target_depth;          // (H, W)
+    float* accum_at_target;       // (H, W)
+    // Backward-side gradient (filled by autograd, read by backward.cu).
+    float* dL_daccum_at_target;   // (H, W)
+
     // Input upstream gradients
     float* dL_dout_attr_float32;  // (H, W, C), gradient of RGB color or other features
 

@@ -148,7 +148,7 @@ void BuildAccelerationStructure(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 TraceSurfelsCUDA(
     const OptiXStateWrapper& stateWrapper,
     const bool training,
@@ -170,7 +170,8 @@ TraceSurfelsCUDA(
     const torch::Tensor& campos,
     const bool prefiltered,
     const bool debug,
-    const torch::Tensor& pixel_weight)
+    const torch::Tensor& pixel_weight,
+    const torch::Tensor& target_depth)
 {
     // Create CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -211,6 +212,9 @@ TraceSurfelsCUDA(
     // Sky-weighted per-Gaussian accumulator. Only meaningful when pixel_weight is
     // provided (non-empty); otherwise stays at zero and the caller can ignore it.
     torch::Tensor accum_gaussian_sky_weights = torch::zeros({P}, float_opts);
+    // Front-side per-pixel accumulator. Only meaningful when target_depth is
+    // provided (non-empty); zero otherwise.
+    torch::Tensor accum_at_target = torch::zeros({H, W}, float_opts);
 
 
     // Create global parameters for the OptiX program
@@ -251,6 +255,12 @@ TraceSurfelsCUDA(
     // sky-weighted accumulation path entirely.
     params.pixel_weight = pixel_weight.numel() > 0 ? pixel_weight.contiguous().data_ptr<float>() : nullptr;
     params.accum_gaussian_sky_weights = accum_gaussian_sky_weights.contiguous().data_ptr<float>();
+    // target_depth is optional: caller may pass an empty tensor to skip the
+    // front-side accumulation snapshot path entirely. accum_at_target is
+    // always allocated but stays zero unless target_depth was supplied.
+    params.target_depth = target_depth.numel() > 0 ? target_depth.contiguous().data_ptr<float>() : nullptr;
+    params.accum_at_target = accum_at_target.contiguous().data_ptr<float>();
+    params.dL_daccum_at_target = nullptr;  // unused in forward
 
 
     // Allocate memory for the parameters
@@ -268,8 +278,9 @@ TraceSurfelsCUDA(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Return
-    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
-        out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights);
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+        out_attr_float32, out_attr_uint32, accum_gaussian_weights,
+        accum_gaussian_sky_weights, accum_at_target);
 }
 
 
@@ -296,7 +307,10 @@ TraceSurfelsBackwardCUDA(
     const bool debug,
     const torch::Tensor& out_attr_float32,
     const torch::Tensor& out_attr_uint32,
-    const torch::Tensor& dL_dout_attr_float32
+    const torch::Tensor& dL_dout_attr_float32,
+    const torch::Tensor& target_depth,
+    const torch::Tensor& accum_at_target,
+    const torch::Tensor& dL_daccum_at_target
 ){
     // Create CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -365,6 +379,11 @@ TraceSurfelsBackwardCUDA(
     params.out_attr_uint32 = out_attr_uint32.contiguous().data_ptr<int>();
     // Store input upstream gradients
     params.dL_dout_attr_float32 = dL_dout_attr_float32.contiguous().data_ptr<float>();
+    // Front-side accumulation pointers. All three must be non-null together
+    // for the new gradient path to fire; otherwise it's a no-op.
+    params.target_depth = target_depth.numel() > 0 ? target_depth.contiguous().data_ptr<float>() : nullptr;
+    params.accum_at_target = accum_at_target.numel() > 0 ? accum_at_target.contiguous().data_ptr<float>() : nullptr;
+    params.dL_daccum_at_target = dL_daccum_at_target.numel() > 0 ? dL_daccum_at_target.contiguous().data_ptr<float>() : nullptr;
     // Store output gradients
     params.dL_dmeans3D = reinterpret_cast<glm::vec3*>(dL_dmeans3D.contiguous().data_ptr<float>());
     params.dL_dgrads3D_abs = reinterpret_cast<glm::vec3*>(dL_dgrads3D_abs.contiguous().data_ptr<float>());

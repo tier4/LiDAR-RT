@@ -125,6 +125,7 @@ def training(args):
             "lambda_reg": getattr(args.opt, "lambda_reg", None),
             "lambda_sky": getattr(args.opt, "lambda_sky", None),
             "lambda_freespace": getattr(args.opt, "lambda_freespace", None),
+            "lambda_front_acc": getattr(args.opt, "lambda_front_acc", None),
             "lambda_occupancy": getattr(args.opt, "lambda_occupancy", None),
             "occupancy_voxel_size": getattr(args.opt, "occupancy_voxel_size", None),
             "occupancy_warmup_iter": getattr(args.opt, "occupancy_warmup_iter", None),
@@ -233,9 +234,25 @@ def training(args):
         sky_prune_enabled = bool(getattr(args.opt, "sky_prune_enabled", False))
         pixel_weight = sky_mask.float() if sky_prune_enabled else None
 
+        # Front-side accumulation target depth: for pixels where GT returned
+        # a hit, set target = gt_depth so the kernel snapshots accumulated
+        # alpha BEFORE the real surface (phantom-in-front signal). For sky
+        # pixels, set target = large sentinel so the snapshot equals the
+        # full-ray integral — subsumes the old freespace_loss behaviour
+        # when lambda_front_acc is non-zero.
+        lambda_front_acc = float(getattr(args.opt, "lambda_front_acc", 0.0))
+        if lambda_front_acc > 0:
+            gt_depth_pre = cur_lidar.get_depth(frame).cuda()
+            target_depth = torch.where(
+                gt_mask, gt_depth_pre, torch.full_like(gt_depth_pre, 1e6)
+            )
+        else:
+            target_depth = None
+
         render_pkg = raytracing(
             frame, gaussians_assets, cur_lidar, background, args,
             pixel_weight=pixel_weight,
+            target_depth=target_depth,
         )
         batch_time = time.time() - end
         depth = render_pkg["depth"]
@@ -245,6 +262,7 @@ def training(args):
         means3d = render_pkg["means3D"]
         acc_wet = render_pkg["accum_gaussian_weight"]
         acc_sky_wet = render_pkg["accum_gaussian_sky_weight"]
+        accum_at_target = render_pkg["accum_at_target"]
 
         H, W = depth.shape[0], depth.shape[1]
 
@@ -345,6 +363,21 @@ def training(args):
         else:
             loss_freespace = torch.tensor(0.0, device="cuda")
 
+        # === Front-side accumulation loss ===
+        # Penalises alpha accumulated strictly in front of the LiDAR's GT hit
+        # (or to infinity for sky rays). Directly addresses Tokyo / Hesai
+        # OT128 horizon-ring phantoms that survive sky_loss / freespace_loss
+        # — those only operate on sky pixels, whereas horizon phantoms sit
+        # on rays that DO return a building hit at moderate range.
+        if lambda_front_acc > 0:
+            front_phantom = accum_at_target > 0
+            if front_phantom.any():
+                loss_front_acc = lambda_front_acc * accum_at_target[front_phantom].mean()
+            else:
+                loss_front_acc = torch.tensor(0.0, device="cuda")
+        else:
+            loss_front_acc = torch.tensor(0.0, device="cuda")
+
         # === 3D occupancy loss ===
         # Penalises the opacity of background Gaussians whose centres sit in
         # voxels no training LiDAR return ever fell into (dynamic-bbox
@@ -366,7 +399,7 @@ def training(args):
         else:
             loss_occupancy = torch.tensor(0.0, device="cuda")
 
-        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace + loss_occupancy
+        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace + loss_occupancy + loss_front_acc
 
         # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
         if not torch.isfinite(loss):
@@ -511,6 +544,8 @@ def training(args):
                         "train/sky_loss": loss_sky.item(),
                         # Free-space supervision
                         "train/freespace_loss": loss_freespace.item(),
+                        # Front-side accumulation supervision
+                        "train/front_acc_loss": loss_front_acc.item(),
                         # 3D occupancy supervision
                         "train/occupancy_loss": loss_occupancy.item(),
                         # Densification
@@ -1082,6 +1117,7 @@ if __name__ == "__main__":
     parser.add_argument("--occupancy_voxel_size", type=float, default=None)
     parser.add_argument("--occupancy_warmup_iter", type=int, default=None)
     parser.add_argument("--lambda_freespace", type=float, default=None)
+    parser.add_argument("--lambda_front_acc", type=float, default=None)
     parser.add_argument("--lambda_sky", type=float, default=None)
     parser.add_argument("--exp_suffix", type=str, default="",
                         help="Append to exp_name (use to keep sweep run dirs distinct)")
@@ -1101,6 +1137,7 @@ if __name__ == "__main__":
         "occupancy_voxel_size": launch_args.occupancy_voxel_size,
         "occupancy_warmup_iter": launch_args.occupancy_warmup_iter,
         "lambda_freespace": launch_args.lambda_freespace,
+        "lambda_front_acc": launch_args.lambda_front_acc,
         "lambda_sky": launch_args.lambda_sky,
     }
     for k, v in opt_overrides.items():

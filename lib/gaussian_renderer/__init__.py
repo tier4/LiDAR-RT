@@ -22,6 +22,7 @@ def raytracing(
     override_color=None,
     decomp=False,
     pixel_weight: torch.Tensor | None = None,
+    target_depth: torch.Tensor | None = None,
 ):
 
     if decomp == "background":
@@ -145,7 +146,7 @@ def raytracing(
     )  # (V, 3), (F, 3)
     tracer.build_acceleration_structure(vertices, faces, rebuild=True)
 
-    rendered_tensor, accum_gaussian_weights, accum_gaussian_sky_weights = tracer(
+    rendered_tensor, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target = tracer(
         ray_o=rays_o,  # (H, W, 3)
         ray_d=rays_d,  # (H, W, 3)
         mesh_normals=mesh_normals,  # (V, 3)
@@ -159,6 +160,7 @@ def raytracing(
         cov3Ds_precomp=None,
         tracer_settings=tracer_settings,
         pixel_weight=pixel_weight,  # (H, W) float or None
+        target_depth=target_depth,  # (H, W) float or None
     )
 
     # mean2D
@@ -190,4 +192,8 @@ def raytracing(
         # Zero when pixel_weight is None; otherwise per-Gaussian sum of
         # alpha*T weighted by pixel_weight (typically the sky mask).
         "accum_gaussian_sky_weight": accum_gaussian_sky_weights.unsqueeze(-1),
+        # Zero when target_depth is None; otherwise per-pixel sum of
+        # alpha*T over hits with dpt < target_depth. Used by the front-side
+        # accumulation loss to detect phantoms in front of the real surface.
+        "accum_at_target": accum_at_target,
     }

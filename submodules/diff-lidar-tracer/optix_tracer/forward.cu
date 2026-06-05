@@ -176,6 +176,13 @@ extern "C" __global__ void __raygen__ot()
     glm::vec3 C = glm::vec3(0.0f);
     float D = 0.0f;
 	float W = 0.0f;
+    // W_target: running sum of alpha*T limited to hits with dpt < target_depth.
+    // Used by the front-side accumulation loss. target_depth = 0 means "no
+    // snapshot for this pixel" (W_target stays at 0). Sky rays pass a large
+    // sentinel so the snapshot equals the full ray integral.
+    float W_target = 0.0f;
+    const bool has_target = (params.target_depth != nullptr);
+    const float target_dpt = has_target ? params.target_depth[tidx] : 0.0f;
     float T = 1.0f;
     float test_T = 1.0f;
     float last_dpt = 1e16f;
@@ -268,6 +275,9 @@ extern "C" __global__ void __raygen__ot()
             // Render other componments
             D += w * dpt;
             W += w;
+            if (has_target && target_dpt > 0.0f && dpt < target_dpt) {
+                W_target += w;
+            }
 
             atomicAdd(params.accum_gaussian_weights + gidx, w);
             if (params.pixel_weight != nullptr) {
@@ -309,7 +319,12 @@ extern "C" __global__ void __raygen__ot()
     params.out_attr_float32[NUM_CHANNELS_F * tidx + NORMAL_OFFSET + 2] = N.z;
     
     params.out_attr_float32[NUM_CHANNELS_F * tidx + FINALT_OFFSET] = T;
-    
+
+    // Front-side accumulation snapshot (only when target_depth was supplied).
+    if (params.accum_at_target != nullptr) {
+        params.accum_at_target[tidx] = W_target;
+    }
+
 
 }
 

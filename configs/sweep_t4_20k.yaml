@@ -52,7 +52,10 @@ parameters:
 
   # Co-tuned with occupancy because all three target the same phantom-Gaussian
   # failure mode; their best joint point likely shifts when one of them moves.
-  lambda_freespace:
+  # Note: lambda_freespace is now off by default (replaced by lambda_front_acc
+  # which covers sky rays too via the target_depth = ∞ sentinel). Sweep just
+  # the front-acc weight here.
+  lambda_front_acc:
     distribution: log_uniform_values
     min: 0.01
     max: 0.2

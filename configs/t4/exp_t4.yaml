@@ -51,7 +51,11 @@ opt:
   lambda_raydrop_bce: 0.01
   lambda_reg: 0.1
   lambda_sky: 0.02
-  lambda_freespace: 0.05  # Push accumulated alpha to 0 on sky rays (direct opacity gradient)
+  lambda_freespace: 0.0   # Replaced by lambda_front_acc (covers sky rays via target_depth=∞ sentinel).
+                          # Set to 0 to turn the old sky-only freespace loss off.
+  lambda_front_acc: 0.05  # Penalise alpha accumulated strictly in front of GT hit (or ∞ for sky).
+                          # Front-side accumulation loss: directly attacks horizon-ring phantoms
+                          # on hit rays that the sky-only freespace loss cannot see.
   lambda_occupancy: 0.05  # Penalise opacity of bg Gaussians sitting in voxels no LiDAR return ever hit
   occupancy_voxel_size: 0.5    # World-frame voxel size (m) for the occupancy grid
   occupancy_warmup_iter: 3000  # Gate the loss until densification has settled

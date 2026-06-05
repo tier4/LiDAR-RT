@@ -474,6 +474,11 @@ extern "C" __global__ void __raygen__ot()
 		dL_drgb[i] = params.dL_dout_attr_float32[NUM_CHANNELS_F * tidx + RGB_OFFSET + i];
 	float dL_ddpt = params.dL_dout_attr_float32[NUM_CHANNELS_F * tidx + DEPTH_OFFSET];
 	float dL_dacc = params.dL_dout_attr_float32[NUM_CHANNELS_F * tidx + ACCUM_OFFSET];
+	// Front-side accumulation gradient (zero when the loss didn't ask for it).
+	const bool has_target = (params.target_depth != nullptr
+							 && params.dL_daccum_at_target != nullptr);
+	const float target_dpt = has_target ? params.target_depth[tidx] : 0.0f;
+	const float dL_dacc_target = has_target ? params.dL_daccum_at_target[tidx] : 0.0f;
 	float3 dL_dnorm = make_float3(
 		params.dL_dout_attr_float32[NUM_CHANNELS_F * tidx + NORMAL_OFFSET],
 		params.dL_dout_attr_float32[NUM_CHANNELS_F * tidx + NORMAL_OFFSET + 1],
@@ -492,12 +497,18 @@ extern "C" __global__ void __raygen__ot()
 	
 	const float final_T = params.out_attr_float32[NUM_CHANNELS_F * tidx + FINALT_OFFSET];
 	const float final_W = params.out_attr_float32[NUM_CHANNELS_F * tidx + ACCUM_OFFSET];
+	const float final_W_target = (params.accum_at_target != nullptr)
+		? params.accum_at_target[tidx] : 0.0f;
 
 	// Prepare gradients computation data
     glm::vec3 C = {0.0f, 0.0f, 0.0f};
     float D = 0.0f;
 	float3 N = {0.0f, 0.0f, 0.0f};
 	float W = 0.0f;
+	// Running sum of alpha*T for hits strictly in front of target_depth.
+	// Mirrors the forward W_target so the gradient on alpha uses the same
+	// "(final_W_target - W_target_so_far)" chain-rule pattern as W.
+	float W_target = 0.0f;
 	float T = 1.0;
 	float test_T = 1.0f;
 
@@ -579,6 +590,9 @@ extern "C" __global__ void __raygen__ot()
             N += w * normal;
             D += w * dpt;
             W += w;
+            if (has_target && target_dpt > 0.0f && dpt < target_dpt) {
+                W_target += w;
+            }
 
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel pair)
@@ -606,6 +620,18 @@ extern "C" __global__ void __raygen__ot()
 			// gives ∂W_total/∂α_i = T_i - (W_total - W_so_far)/(1-α_i), the
 			// same pattern as depth with attribute = 1 instead of dpt.
 			dL_dalpha += dL_dacc * (T - (final_W - W) * inv_1_alpha);
+
+			// Front-side accumulation supervision (only active for hits
+			// strictly in front of this pixel's target_depth). Same
+			// chain-rule form, but using W_target (running sum of alpha*T
+			// over the truncated set) instead of W_total. Hits beyond
+			// target_depth contribute zero gradient from this path, so
+			// the loss can only push down alpha of Gaussians sitting in
+			// front of the real surface — exactly the front-side phantom.
+			if (has_target && target_dpt > 0.0f && dpt < target_dpt) {
+				dL_dalpha += dL_dacc_target *
+					(T - (final_W_target - W_target) * inv_1_alpha);
+			}
 
 			float3 dL_dnormal_gs = dL_dnorm * w;
 			dL_dalpha += sumf3(dL_dnorm * (T * normal - (final_normal - N) * inv_1_alpha));

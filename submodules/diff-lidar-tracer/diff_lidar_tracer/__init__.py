@@ -28,6 +28,7 @@ class _Tracer(torch.autograd.Function):
                 cov3Ds_precomp,
                 tracer_settings,
                 pixel_weight,
+                target_depth,
                 ):
 
         # Restructure arguments the way that the C++ lib expects them
@@ -51,40 +52,46 @@ class _Tracer(torch.autograd.Function):
                 tracer_settings.campos,
                 tracer_settings.prefiltered,
                 tracer_settings.debug,
-                pixel_weight)
+                pixel_weight,
+                target_depth)
 
         # Invoke C++/CUDA/OptiX tracer
         if tracer_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights = _C.trace_surfels(*args)
+                out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target = _C.trace_surfels(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights = _C.trace_surfels(*args)
+            out_attr_float32, out_attr_uint32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target = _C.trace_surfels(*args)
 
-        # Keep relevant tensors for backward
+        # Keep relevant tensors for backward (incl. target_depth + accum_at_target
+        # so the backward kernel can re-trace and reproduce the W_target running
+        # sum and gradient term).
         ctx.tracer_settings = tracer_settings
         ctx.optix_context = optix_context
         ctx.save_for_backward(ray_o, ray_d, vertices, means3D, shs, colors_precomp, opacities, scales, rotations, cov3Ds_precomp,
-                              out_attr_float32, out_attr_uint32)
+                              out_attr_float32, out_attr_uint32, target_depth, accum_at_target)
 
         # Return the per-Gaussian hit counter for training gradient filtering.
         # accum_gaussian_sky_weights is zero unless pixel_weight was a non-empty
-        # tensor — used by the sky hard-prune path to localise Gaussians whose
-        # contribution concentrates in sky-mask pixels.
-        return out_attr_float32, accum_gaussian_weights, accum_gaussian_sky_weights
+        # tensor — used by the sky hard-prune path. accum_at_target is zero
+        # unless target_depth was a non-empty tensor — used by the front-side
+        # accumulation loss to penalise alpha contributions in front of the
+        # real LiDAR hit.
+        return out_attr_float32, accum_gaussian_weights, accum_gaussian_sky_weights, accum_at_target
 
     @staticmethod
-    def backward(ctx, grad_out_attr_float32, _, _sky):
+    def backward(ctx, grad_out_attr_float32, _, _sky, grad_accum_at_target):
 
         # Restore necessary values from context
         tracer_settings = ctx.tracer_settings
         optix_context = ctx.optix_context
-        ray_o, ray_d, vertices, means3D, shs, colors_precomp, opacities, scales, rotations, cov3Ds_precomp, \
-            out_attr_float32, out_attr_uint32 = ctx.saved_tensors
+        (ray_o, ray_d, vertices, means3D, shs, colors_precomp, opacities, scales,
+         rotations, cov3Ds_precomp, out_attr_float32, out_attr_uint32,
+         target_depth, accum_at_target) = ctx.saved_tensors
         # Restructure args as C++ method expects them
         args = (optix_context,
                 ray_o,
@@ -107,7 +114,10 @@ class _Tracer(torch.autograd.Function):
                 tracer_settings.debug,
                 out_attr_float32,
                 out_attr_uint32,
-                grad_out_attr_float32)
+                grad_out_attr_float32,
+                target_depth,
+                accum_at_target,
+                grad_accum_at_target)
 
         # Compute gradients for relevant tensors by invoking backward method
         if tracer_settings.debug:
@@ -136,6 +146,7 @@ class _Tracer(torch.autograd.Function):
             grad_cov3Ds_precomp,
             None,
             None,  # pixel_weight (not differentiated)
+            None,  # target_depth (not differentiated)
         )
 
         return grads
@@ -189,6 +200,7 @@ class Tracer(nn.Module):
                 cov3Ds_precomp: torch.Tensor = None,
                 tracer_settings: TracingSettings = None,
                 pixel_weight: torch.Tensor = None,
+                target_depth: torch.Tensor = None,
                 ):
 
         # Check if colors or SHs are provided
@@ -207,6 +219,9 @@ class Tracer(nn.Module):
         if cov3Ds_precomp is None: cov3Ds_precomp = torch.Tensor([]).cuda()
         # Empty pixel_weight => kernel falls back to no-op for sky weights.
         if pixel_weight is None: pixel_weight = torch.Tensor([]).cuda()
+        # Empty target_depth => kernel falls back to no-op for the front-side
+        # accumulation snapshot.
+        if target_depth is None: target_depth = torch.Tensor([]).cuda()
 
         # Invoke the autograd function
         return _Tracer.apply(
@@ -225,4 +240,5 @@ class Tracer(nn.Module):
             cov3Ds_precomp,
             tracer_settings,
             pixel_weight,
+            target_depth,
         )
