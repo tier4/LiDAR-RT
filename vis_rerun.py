@@ -331,77 +331,117 @@ def main():
     origin_offset = first_ego[:3, 3].copy()
     print(f"Origin offset (first frame ego): {origin_offset}", flush=True)
 
-    # --- Occupancy grid (SLAM-style 3-state: occupied / free / unknown) ---
-    # Built or loaded from cache using the same args.opt.* knobs as training;
-    # visualised statically as two point clouds layered under world/occupancy.
-    # 'occupied' = green voxel centres where a BG LiDAR return landed; 'free'
-    # = blue voxel centres traversed by some training ray. 'unknown' is
-    # implicit (= space neither shown).
-    try:
-        from lib.scene.occupancy_grid import WorldOccupancyGrid
-
-        # vis_rerun's load_scene_fast yields raw bboxes dict; OccupancyGrid
-        # expects objects with a .bounding_box attribute, so wrap.
-        class _BBoxRef:
-            __slots__ = ("bounding_box",)
-            def __init__(self, b):
-                self.bounding_box = b
-        bbox_refs = [_BBoxRef(b) for b in bboxes.values()]
-
-        occ_voxel_size = float(getattr(args.opt, "occupancy_voxel_size", 0.5))
-        occ_max_depth = float(getattr(args.opt, "occupancy_free_max_depth", 100.0))
-        occupancy_grid = WorldOccupancyGrid(voxel_size=occ_voxel_size)
-        cache_dir = os.path.join(args.model_dir, ".occupancy_grid_cache")
-        stats = occupancy_grid.build_or_load_cache(
-            lidars, bbox_refs,
-            max_depth=occ_max_depth,
-            cache_dir=cache_dir,
-            cache_extra={"source_dir": str(getattr(args, "source_dir", "")),
-                         "frame_length": list(args.frame_length)},
-        )
-        cache_tag = "(cached)" if stats.get("cached") else "(built)"
-        print(f"[Occupancy] {cache_tag} voxel_size={stats['voxel_size']}  "
-              f"occupied_voxels={stats['n_occupied']:,}  "
-              f"free_voxels={stats['n_free']:,}", flush=True)
-
-        # Occupied voxels only, drawn as transparent red cubes (one per voxel)
-        # so the LiDAR-hit support of the static scene reads as a solid
-        # volumetric structure rather than a fog of points. Free / unknown
-        # voxels are intentionally not visualised — at voxel_size=0.1m the
-        # free set is hundreds of millions of cubes, which would tank the
-        # rerun viewer; occupied alone is the diagnostic signal (= where
-        # the model SHOULD have surface).
-        OCC_VIZ_CAP = 500_000
-
-        def _maybe_subsample_keys(keys: torch.Tensor, cap: int) -> torch.Tensor:
-            if keys.numel() <= cap:
-                return keys
-            # randint (with-replacement) so we never allocate an O(N) randperm
-            # buffer; at this ratio it's statistically indistinguishable.
-            idx = torch.randint(0, keys.numel(), (cap,), device=keys.device)
-            return keys[idx]
-
-        occ_keys_viz = _maybe_subsample_keys(occupancy_grid.occupied_keys, OCC_VIZ_CAP)
-        if occ_keys_viz.numel() < occupancy_grid.occupied_keys.numel():
-            print(f"[Occupancy] occupied voxels subsampled "
-                  f"{stats['n_occupied']:,} → {OCC_VIZ_CAP:,} for viz", flush=True)
-        occ_centers = occupancy_grid.voxel_centers(occ_keys_viz)
-        occ_np = (occ_centers.cpu().numpy().astype(np.float64) - origin_offset)
-
-        if occ_np.shape[0] > 0:
-            n = occ_np.shape[0]
-            sizes = np.full((n, 3), float(occ_voxel_size), dtype=np.float32)
-            # Translucent red — RGBA alpha 60/255 ≈ 23% so dense regions stack
-            # into a visible volume while individual cubes don't occlude the
-            # GT / rendered point clouds underneath.
-            colors = np.tile(
-                np.array([255, 0, 0, 60], dtype=np.uint8), (n, 1)
+    # --- Occupancy grid visualisation (disabled) ---
+    # The translucent red occupied-voxel boxes were turned off in favour of
+    # direct per-Gaussian ellipsoid rendering below. Re-enable by flipping
+    # the flag if you need the voxel-grid overlay back (and keep voxel_size
+    # ≥ 0.3 m or rerun starts struggling at >1M cubes).
+    SHOW_OCCUPANCY_BOXES = False
+    if SHOW_OCCUPANCY_BOXES:
+        try:
+            from lib.scene.occupancy_grid import WorldOccupancyGrid
+            class _BBoxRef:
+                __slots__ = ("bounding_box",)
+                def __init__(self, b):
+                    self.bounding_box = b
+            bbox_refs = [_BBoxRef(b) for b in bboxes.values()]
+            occ_voxel_size = float(getattr(args.opt, "occupancy_voxel_size", 0.5))
+            occ_max_depth = float(getattr(args.opt, "occupancy_free_max_depth", 100.0))
+            occupancy_grid = WorldOccupancyGrid(voxel_size=occ_voxel_size)
+            cache_dir = os.path.join(args.model_dir, ".occupancy_grid_cache")
+            stats = occupancy_grid.build_or_load_cache(
+                lidars, bbox_refs, max_depth=occ_max_depth, cache_dir=cache_dir,
+                cache_extra={"source_dir": str(getattr(args, "source_dir", "")),
+                             "frame_length": list(args.frame_length)},
             )
-            rr.log("world/occupancy/occupied",
-                   rr.Boxes3D(centers=occ_np, sizes=sizes, colors=colors),
-                   static=True)
+            OCC_VIZ_CAP = 500_000
+            occ_keys = occupancy_grid.occupied_keys
+            if occ_keys.numel() > OCC_VIZ_CAP:
+                idx = torch.randint(0, occ_keys.numel(), (OCC_VIZ_CAP,), device=occ_keys.device)
+                occ_keys = occ_keys[idx]
+            occ_np = (occupancy_grid.voxel_centers(occ_keys).cpu().numpy().astype(np.float64) - origin_offset)
+            if occ_np.shape[0] > 0:
+                sizes = np.full((occ_np.shape[0], 3), float(occ_voxel_size), dtype=np.float32)
+                colors = np.tile(np.array([255, 0, 0, 60], dtype=np.uint8), (occ_np.shape[0], 1))
+                rr.log("world/occupancy/occupied",
+                       rr.Boxes3D(centers=occ_np, sizes=sizes, colors=colors),
+                       static=True)
+        except Exception as e:
+            print(f"[Occupancy] viz skipped: {type(e).__name__}: {e}", flush=True)
+
+    # --- bg Gaussian ellipsoid visualisation ---
+    # Renders each (subsampled) bg surfel as an oriented 3D ellipsoid in
+    # rerun so the shape distribution is directly inspectable: needle-like
+    # phantoms appear as thin red ellipsoids, healthy surfels as more
+    # isotropic green ones. The third axis is set tiny (2D surfel → thin
+    # disc) to preserve geometric meaning rather than inflate to a sphere.
+    # Subsampled to keep the viewer responsive (2M+ ellipsoids would tank
+    # it). Colour encodes aniso (green→red over σmax/σmin = 1→20+), alpha
+    # encodes opacity (transparent → opaque).
+    try:
+        bg = gaussians[0]
+        n_bg = bg._xyz.shape[0]
+        BG_VIZ_CAP = 150_000
+        if n_bg > BG_VIZ_CAP:
+            sel = torch.randint(0, n_bg, (BG_VIZ_CAP,), device=bg._xyz.device)
+        else:
+            sel = torch.arange(n_bg, device=bg._xyz.device)
+
+        xyz = bg._xyz.detach()[sel]
+        rot_wxyz = bg._rotation.detach()[sel]
+        sc_2d = torch.exp(bg._scaling.detach()[sel])           # (S, 2)
+        opa = torch.sigmoid(bg._opacity.detach()[sel]).view(-1)  # (S,)
+
+        # Half-sizes: σ on the two surfel axes, tiny on the normal axis so
+        # the ellipsoid stays disc-shaped (matches the 2D-Gaussian model).
+        thickness = 0.005
+        half_sizes = torch.cat([
+            sc_2d,
+            torch.full((sc_2d.shape[0], 1), thickness, device=sc_2d.device),
+        ], dim=-1).cpu().numpy()
+
+        # Quaternion: model stores (w, x, y, z); rerun expects (x, y, z, w).
+        rot_norm = rot_wxyz / rot_wxyz.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        quats_xyzw = rot_norm[:, [1, 2, 3, 0]].cpu().numpy()
+
+        # Colour: aniso → hue (green at 1, red at ≥20), opacity → alpha
+        # (min alpha=30 so even near-zero α stays faintly visible).
+        aniso = (sc_2d.max(-1).values / sc_2d.min(-1).values.clamp_min(1e-12)).clamp_max(50.0)
+        aniso_norm = ((aniso - 1.0) / 19.0).clamp(0.0, 1.0)
+        r = (aniso_norm * 255).to(torch.uint8)
+        g = ((1.0 - aniso_norm) * 255).to(torch.uint8)
+        b = torch.zeros_like(r)
+        a = (opa * 180 + 30).clamp(0, 255).to(torch.uint8)
+        colors = torch.stack([r, g, b, a], dim=-1).cpu().numpy()
+
+        centers = xyz.cpu().numpy().astype(np.float64) - origin_offset
+
+        # FillMode.Solid renders filled ellipsoids; falls back to wireframe
+        # if the rerun version doesn't expose it.
+        try:
+            fill_mode = rr.components.FillMode.Solid
+        except Exception:
+            fill_mode = None
+
+        if centers.shape[0] > 0:
+            rr.log(
+                "world/gaussians/bg",
+                rr.Ellipsoids3D(
+                    centers=centers,
+                    half_sizes=half_sizes,
+                    quaternions=quats_xyzw,
+                    colors=colors,
+                    fill_mode=fill_mode,
+                ),
+                static=True,
+            )
+            n_needle = int(((aniso > 10) & (opa > 0.3)).sum())
+            print(f"[Gaussians] bg: {n_bg:,} → viz {centers.shape[0]:,} ellipsoids "
+                  f"(green→red by aniso, α by opacity); "
+                  f"~{n_needle:,} sampled as needles (aniso>10 & α>0.3)",
+                  flush=True)
     except Exception as e:
-        print(f"[Occupancy] viz skipped: {type(e).__name__}: {e}", flush=True)
+        print(f"[Gaussians] bg viz skipped: {type(e).__name__}: {e}", flush=True)
 
     # Per-sensor colors for 3D points
     SENSOR_COLORS = [
