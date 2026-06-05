@@ -65,7 +65,12 @@ opt:
   # phantom" pattern at horizon ring and ground edges). Off when either
   # threshold or boost is 0.
   edge_depth_grad_thresh: 5.0   # m/pixel; below this the pixel isn't an edge
-  edge_loss_boost: 2.0          # added on top of 1.0 → edge pixels get 3x
+  edge_loss_boost: 0.5          # added on top of 1.0 → edge pixels get 1.5x.
+                                # Higher values amplify the depth gradient at
+                                # edges → drives extra densification there
+                                # (observed 2.57M points by iter 3K with
+                                # boost=2.0). 0.5 keeps the anti-phantom
+                                # signal while throttling over-densify.
 
   # Stack loss (B): kernel-level soft contributor count per pixel +
   # edge-restricted L1 on (n_contributors - 1). Directly targets the

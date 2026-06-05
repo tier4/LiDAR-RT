@@ -58,6 +58,23 @@ def _pack_keys(voxel_idx: torch.Tensor):
     return keys, in_range
 
 
+def _sorted_isin(query: torch.Tensor, sorted_keys: torch.Tensor) -> torch.Tensor:
+    """Memory-frugal replacement for torch.isin: searchsorted-based membership
+    test that assumes sorted_keys is ascending-sorted (true for our
+    free_keys / occupied_keys, both produced by torch.unique which sorts).
+
+    torch.isin allocates ~O(|query| + |sorted_keys|) of temporary work
+    buffers internally — at voxel_size=0.1m we have ~381M free_keys so a
+    single call asks for ~5-6 GB of contiguous GPU memory and OOMs under
+    concurrent training. This implementation uses O(|query|) extra memory
+    via searchsorted.
+    """
+    if sorted_keys.numel() == 0 or query.numel() == 0:
+        return torch.zeros_like(query, dtype=torch.bool)
+    idx = torch.searchsorted(sorted_keys, query).clamp_max(sorted_keys.shape[0] - 1)
+    return sorted_keys[idx] == query
+
+
 @torch.no_grad()
 def _trace_ray_voxels(rays_o: torch.Tensor,
                       rays_d: torch.Tensor,
@@ -375,9 +392,9 @@ class WorldOccupancyGrid:
             return torch.zeros(world_xyz.shape[0], dtype=torch.bool,
                                device=world_xyz.device)
         keys, in_range = self._xyz_to_keys(world_xyz)
-        in_free = torch.isin(keys, self.free_keys)
+        in_free = _sorted_isin(keys, self.free_keys)
         if self.occupied_keys is not None and self.occupied_keys.numel() > 0:
-            in_occ = torch.isin(keys, self.occupied_keys)
+            in_occ = _sorted_isin(keys, self.occupied_keys)
         else:
             in_occ = torch.zeros_like(in_free)
         free_in_range = in_free & ~in_occ
@@ -412,10 +429,10 @@ class WorldOccupancyGrid:
         is_free = torch.zeros(n, dtype=torch.bool, device=device)
         keys, in_range = self._xyz_to_keys(world_xyz)
         if self.occupied_keys is not None and self.occupied_keys.numel() > 0:
-            in_occ = torch.isin(keys, self.occupied_keys)
+            in_occ = _sorted_isin(keys, self.occupied_keys)
             is_occupied[in_range] = in_occ
         if self.free_keys is not None and self.free_keys.numel() > 0:
-            in_free = torch.isin(keys, self.free_keys)
+            in_free = _sorted_isin(keys, self.free_keys)
             # free supersedes occupied? No — occupied wins (it's the stronger
             # evidence: an actual hit). So mask out occupied from free.
             is_free[in_range] = in_free & ~is_occupied[in_range]
