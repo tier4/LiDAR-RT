@@ -139,6 +139,24 @@ opt:
   lambda_stack: 0.05
   contributor_alpha_threshold: 0.1   # sigmoid midpoint over alpha
   contributor_alpha_sharpness: 50.0  # higher → step-like
+  # === Per-edge-ray allowed-depth loss ===
+  # For each edge pixel (sobel_edge | sky_boundary) we precompute the depth
+  # ranges along the ray that are within `edge_ray_dist_threshold` of any
+  # GT point (union of all train frames' bg GT). At training time the
+  # rendered depth at edge pixels is penalised by its distance to the
+  # nearest allowed interval. This is RAY-LOCAL — catches midair phantoms
+  # that chamfer (ray-agnostic) and front_acc (front-only) miss.
+  # See lib/scene/edge_ray_allowed.py for full rationale.
+  # Default OFF (0.0): cache build is ~5-15 min one-shot when enabled.
+  lambda_edge_ray_allowed: 0.0
+  edge_ray_dist_threshold: 0.5     # m; samples within this of GT cloud = allowed
+  edge_ray_num_samples: 100        # log-spaced 0.5-100m
+  edge_ray_min_depth: 0.5
+  edge_ray_max_depth: 100.0
+  edge_ray_max_intervals_per_pixel: 5
+  edge_ray_warmup_iter: 3000       # gate until densification has settled
+  edge_ray_max_loss_dist: 10.0     # per-pixel L1 distance clamp (Huber-style cap)
+
   lambda_occupancy: 0.05  # Penalise opacity of bg Gaussians sitting in voxels no LiDAR return ever hit
   occupancy_voxel_size: 0.1    # World-frame voxel size (m) for the occupancy grid
   occupancy_warmup_iter: 3000  # Gate the loss until densification has settled

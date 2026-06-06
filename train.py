@@ -202,6 +202,45 @@ def training(args):
               f"rays_used={stats.get('n_rays_used', 0)}  "
               f"hit_points_used={stats.get('n_points_used', 0)}")
 
+    # --- Edge-ray allowed-depth intervals (precompute / load) ---
+    # New "ray-local" phantom penalty (see lib/scene/edge_ray_allowed.py).
+    # For each edge pixel in each train frame we precompute the set of depths
+    # along the ray that are within `edge_ray_dist_threshold` of the union of
+    # all train-frame bg GT points. At training time, rendered_depth at edge
+    # pixels gets penalised by its distance to the nearest allowed interval —
+    # catches midair phantoms that chamfer (ray-agnostic) and front_acc
+    # (front-only) miss. Default lambda is 0 → skip build entirely.
+    lambda_edge_ray_allowed = float(getattr(args.opt, "lambda_edge_ray_allowed", 0.0))
+    edge_ray_warmup_iter = int(getattr(args.opt, "edge_ray_warmup_iter", 3000))
+    edge_ray_max_loss_dist = float(getattr(args.opt, "edge_ray_max_loss_dist", 10.0))
+    edge_ray_allowed = None
+    if lambda_edge_ray_allowed > 0:
+        from lib.scene.edge_ray_allowed import EdgeRayAllowed
+        edge_ray_allowed = EdgeRayAllowed(
+            dist_threshold=float(getattr(args.opt, "edge_ray_dist_threshold", 0.5)),
+            num_samples=int(getattr(args.opt, "edge_ray_num_samples", 100)),
+            min_depth=float(getattr(args.opt, "edge_ray_min_depth", 0.5)),
+            max_depth=float(getattr(args.opt, "edge_ray_max_depth", 100.0)),
+            edge_depth_grad_thresh=float(getattr(
+                args.opt, "edge_depth_grad_thresh", 15.0)),
+            max_intervals_per_pixel=int(getattr(
+                args.opt, "edge_ray_max_intervals_per_pixel", 5)),
+        )
+        era_cache_dir = os.path.join(args.model_dir, ".edge_ray_allowed_cache")
+        era_stats = edge_ray_allowed.build_or_load_cache(
+            scene.train_lidars,
+            cache_dir=era_cache_dir,
+            cache_extra={"source_dir": str(getattr(args, "source_dir", "")),
+                         "frame_length": list(args.frame_length)},
+        )
+        edge_ray_allowed.to_cuda()
+        era_tag = "(cached)" if era_stats.get("cached") else "(built)"
+        print(f"[EdgeRayAllowed] {era_tag} "
+              f"dist_threshold={era_stats['dist_threshold']:.2f}m  "
+              f"frames={era_stats['n_frames']}  "
+              f"edge_pixels={era_stats['n_edge_pixels']:,}  "
+              f"intervals={era_stats['n_intervals_total']:,}")
+
     end = time.time()
     frame_s, frame_e = args.frame_length[0], args.frame_length[1]
     render_cams = []
@@ -496,7 +535,23 @@ def training(args):
         else:
             loss_occupancy = torch.tensor(0.0, device="cuda")
 
-        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace + loss_occupancy + loss_front_acc + loss_stack
+        # === Edge-ray allowed-depth loss ===
+        # Distance from rendered_depth at edge pixels to the nearest allowed
+        # interval (precomputed per (sensor, frame, edge pixel)). Catches
+        # midair phantoms on edge rays that chamfer (ray-agnostic) and
+        # front_acc (only "before target_depth") can't see — phantoms in
+        # 3D positions spatially close to a NEIGHBOUR ray's GT but with no
+        # GT support on THIS ray. Off when lambda is 0.
+        if (lambda_edge_ray_allowed > 0 and edge_ray_allowed is not None
+                and iteration >= edge_ray_warmup_iter):
+            from lib.scene.edge_ray_allowed import edge_ray_allowed_loss
+            frame_data = edge_ray_allowed.get_frame_data(cur_lidar.name, frame)
+            loss_edge_ray = lambda_edge_ray_allowed * edge_ray_allowed_loss(
+                depth, frame_data, max_dist=edge_ray_max_loss_dist)
+        else:
+            loss_edge_ray = torch.tensor(0.0, device="cuda")
+
+        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace + loss_occupancy + loss_front_acc + loss_stack + loss_edge_ray
 
         # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
         if not torch.isfinite(loss):
@@ -682,6 +737,8 @@ def training(args):
                         "train/stack_loss": loss_stack.item(),
                         # 3D occupancy supervision
                         "train/occupancy_loss": loss_occupancy.item(),
+                        # Per-edge-ray allowed-depth supervision
+                        "train/edge_ray_loss": loss_edge_ray.item(),
                         # Densification
                         "train/points_num": points_num,
                         "train/clone_sum": clone_sum,
@@ -1300,6 +1357,10 @@ if __name__ == "__main__":
     parser.add_argument("--edge_loss_boost", type=float, default=None)
     parser.add_argument("--lambda_stack", type=float, default=None)
     parser.add_argument("--dead_prune_min_views", type=int, default=None)
+    parser.add_argument("--lambda_edge_ray_allowed", type=float, default=None)
+    parser.add_argument("--edge_ray_dist_threshold", type=float, default=None)
+    parser.add_argument("--edge_ray_warmup_iter", type=int, default=None)
+    parser.add_argument("--edge_ray_max_loss_dist", type=float, default=None)
     parser.add_argument("--exp_suffix", type=str, default="",
                         help="Append to exp_name (use to keep sweep run dirs distinct)")
     launch_args = parser.parse_args()
@@ -1332,6 +1393,11 @@ if __name__ == "__main__":
         "lambda_stack": launch_args.lambda_stack,
         # Dead-Gaussian prune
         "dead_prune_min_views": launch_args.dead_prune_min_views,
+        # Per-edge-ray allowed-depth loss
+        "lambda_edge_ray_allowed": launch_args.lambda_edge_ray_allowed,
+        "edge_ray_dist_threshold": launch_args.edge_ray_dist_threshold,
+        "edge_ray_warmup_iter": launch_args.edge_ray_warmup_iter,
+        "edge_ray_max_loss_dist": launch_args.edge_ray_max_loss_dist,
     }
     for k, v in opt_overrides.items():
         if v is not None:
