@@ -37,16 +37,11 @@ opt:
                                    # before clone/split adds more candidates.
                                    # Cuts the iter 0-1000 churn observed
                                    # in the last run (~200K early prunes).
-  densify_until_iter: 12_000   # Was 15_000. wandb run 8wgqe7k4 analysis: spawn
-                               # exploded iter 10K-15K (cumulative clone went
-                               # 212K → 694K per 1000-iter window, while
-                               # dead_prune killed 48K/cycle out of 69K
-                               # spawn/cycle = 70% immediate-death churn).
-                               # Cap the densify window at 12K to skip that
-                               # waste phase. The cap-saturated bg (500K) is
-                               # mostly built by iter 11K and the eval phantom
-                               # was already 49K → 38K by iter 15K mostly via
-                               # restructuring, not new spawns.
+  densify_until_iter: 15_000   # Sweep bt1rh0dm: ALL top-5 runs picked 15K
+                               # (vs 10K, 12K, 15K options). Earlier "12K cuts
+                               # churn waste" intuition was wrong on the actual
+                               # phantom metric — spawn budget matters more
+                               # than per-spawn survival rate.
   densify_until_num_points: 500_000    # Was 2M, then 1M. Render-sweep analysis
                                        # showed only 22% of bg (470K of 2.13M)
                                        # accumulated any weight across all train
@@ -61,19 +56,18 @@ opt:
 
   densify_use_absgrads: False
   densify_scale_threshold: 0.0002
-  densify_grad_threshold: 0.003   # Was 0.002 (then 0.001 / 0.0005). wandb run
-                                  # 8wgqe7k4 showed extreme churn at the 0.002
-                                  # setting — peak iter 12K had 69K spawn/cycle
-                                  # of which 48K (70%) were immediately killed
-                                  # by dead_prune the same cycle. Raising the
-                                  # gradient bar to 0.003 cuts spawn rate by
-                                  # ~50% so the model only proposes Gaussians
-                                  # at pixels with substantial residual error,
-                                  # not every weak signal. Combined with the
-                                  # densify_until_iter cut to 12K above and the
-                                  # 500K bg cap, expected per-cycle: 30-35K
-                                  # spawn, 10-15K dead, 20K net survivor —
-                                  # ~3x less computational waste than before.
+  densify_grad_threshold: 0.0016  # Sweep bt1rh0dm top-5 picks: 0.00154,
+                                  # 0.00154, 0.00206, 0.00167, 0.00160 — all
+                                  # near the sweep range's bottom (0.0015).
+                                  # Reverses the prior "churn-cut" 0.003 which
+                                  # was 4x worse than the 0.0015 quartile
+                                  # (32K vs 23K phantom mean). Lower bar →
+                                  # more spawn candidates → more chances to
+                                  # find useful geometry. The 70% same-cycle
+                                  # dead_prune rate at low grad_threshold is
+                                  # acceptable cost — surviving 30% beats
+                                  # 70% survivors from a stingier proposal
+                                  # set, on the phantom-pixel metric.
   densify_weight_threshold: 0.0
   prune_size_threshold: 0.1
   thresh_opa_prune: 0.02   # Was 0.001 — bg ckpt analysis showed ~55% of
@@ -136,7 +130,11 @@ opt:
   # "many thin Gaussians lined up at an edge" failure mode. Off when
   # lambda_stack == 0 (the kernel skips the soft-counter atomic adds
   # entirely so unused config stays cheap).
-  lambda_stack: 0.05
+  lambda_stack: 0.10                 # Sweep bt1rh0dm: 0.10 was best in 4/5
+                                     # top-5 runs (vs 0.0, 0.05, 0.2 options);
+                                     # 0.20 was worst (32K phantom mean vs 23K
+                                     # for 0.10). Reaches diminishing returns
+                                     # past 0.10.
   contributor_alpha_threshold: 0.1   # sigmoid midpoint over alpha
   contributor_alpha_sharpness: 50.0  # higher → step-like
   # === Per-edge-ray allowed-depth loss ===
