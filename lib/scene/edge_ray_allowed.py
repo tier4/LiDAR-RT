@@ -213,7 +213,11 @@ class EdgeRayAllowed:
                 sample_pts_flat = sample_pts.reshape(-1, 3)
 
                 # Single batched KDTree query — much faster than per-point.
-                dists, _ = tree.query(sample_pts_flat, k=1)
+                # workers=-1 uses all CPU cores; without it scipy runs
+                # single-threaded and a single frame takes ~7 min for the
+                # ~4.8M points × 8M-point tree scale. With 32 cores the
+                # per-frame cost drops to ~15-30 s.
+                dists, _ = tree.query(sample_pts_flat, k=1, workers=-1)
                 dists = dists.reshape(n_pixels, self.num_samples)
                 allowed = dists < self.dist_threshold  # (N, S)
 
