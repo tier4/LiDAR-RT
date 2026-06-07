@@ -145,8 +145,16 @@ opt:
   # nearest allowed interval. This is RAY-LOCAL — catches midair phantoms
   # that chamfer (ray-agnostic) and front_acc (front-only) miss.
   # See lib/scene/edge_ray_allowed.py for full rationale.
-  # Default OFF (0.0): cache build is ~5-15 min one-shot when enabled.
-  lambda_edge_ray_allowed: 0.0
+  # First run with this enabled triggers ~5-15 min one-shot cache build;
+  # subsequent runs load the disk cache in <1 s.
+  #
+  # Starting weight 0.03: comparable magnitude to stack/front_acc on the
+  # phantom-pixel objective. Per-pixel loss is L1 distance in metres
+  # (clamped 0-10), so a typical mean of ~1-3 m gives loss contribution
+  # ~0.03-0.09 — same order as stack (~0.03) but well below depth_l1
+  # (~0.5). Tune to 0.05-0.10 if effect is too subtle, but verify
+  # eval/total_phantom_pixels does drop first.
+  lambda_edge_ray_allowed: 0.03
   edge_ray_dist_threshold: 0.5     # m; samples within this of GT cloud = allowed
   edge_ray_num_samples: 100        # log-spaced 0.5-100m
   edge_ray_min_depth: 0.5
