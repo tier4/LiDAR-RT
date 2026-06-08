@@ -310,7 +310,7 @@ class SceneLidar(Scene):
         occupancy_grid=None,
     ):
 
-        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num, prune_dead_num = 0, 0, 0, 0, 0, 0, 0, 0, 0
+        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num, prune_dead_num, prune_ego_num = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
         sky_prune_enabled_global = bool(getattr(args.opt, "sky_prune_enabled", False))
         sky_prune_warmup_iter = int(getattr(args.opt, "sky_prune_warmup_iter", 0))
@@ -339,6 +339,42 @@ class SceneLidar(Scene):
         dead_prune_warmup_iter = int(getattr(args.opt, "dead_prune_warmup_iter", 0))
         dead_prune_min_views = int(getattr(args.opt, "dead_prune_min_views", 1))
         dead_prune_min_contrib = float(getattr(args.opt, "dead_prune_min_contrib", 1e-3))
+
+        ego_prune_enabled_global = bool(getattr(args.opt, "ego_prune_enabled", False))
+        ego_prune_warmup_iter = int(getattr(args.opt, "ego_prune_warmup_iter", 0))
+        ego_prune_radius = float(getattr(args.opt, "ego_prune_radius", 1.5))
+        ego_prune_height_above = float(getattr(args.opt, "ego_prune_height_above", 1.5))
+        ego_prune_height_below = float(getattr(args.opt, "ego_prune_height_below", 0.5))
+        # Cache the dense ego-swept point set on first invocation. Points are
+        # the ego2world translations across all train frames for every sensor,
+        # plus 5 interpolated samples per consecutive-frame segment so the
+        # cylinder coverage is continuous along the path (cars move ~2 m at
+        # 10 Hz; 5 interpolations = sub-meter step is well below the prune
+        # radius default).
+        if ego_prune_enabled_global and not hasattr(self, "_ego_centers_cache"):
+            base_pts = []
+            for lidar in self.train_lidars.values():
+                for fid in sorted(set(lidar.train_frames) | set(lidar.eval_frames)):
+                    if fid in lidar.ego2world:
+                        base_pts.append(lidar.ego2world[fid][:3, 3].cpu().numpy())
+            if base_pts:
+                base = np.stack(base_pts, axis=0)  # (M0, 3)
+                interp_n = 5
+                if base.shape[0] >= 2:
+                    a = base[:-1, None, :]
+                    b = base[1:, None, :]
+                    ts = np.linspace(0.0, 1.0, interp_n + 2)[1:-1][None, :, None]
+                    mid = (a + ts * (b - a)).reshape(-1, 3)
+                    self._ego_centers_cache = torch.from_numpy(
+                        np.concatenate([base, mid], axis=0)).float().cuda()
+                else:
+                    self._ego_centers_cache = torch.from_numpy(base).float().cuda()
+                print(f"[ego_prune] cached {self._ego_centers_cache.shape[0]} "
+                      f"ego centers (base {base.shape[0]} + "
+                      f"{interp_n} interp/segment)")
+            else:
+                self._ego_centers_cache = torch.empty(0, 3, device="cuda")
+        ego_centers = getattr(self, "_ego_centers_cache", None)
 
         begin_index = 0
         for gaussians in self.gaussians_assets:
@@ -452,6 +488,13 @@ class SceneLidar(Scene):
                         and gaussians.bounding_box is None
                         and iteration >= dead_prune_warmup_iter
                     )
+                    asset_ego_prune_enabled = (
+                        ego_prune_enabled_global
+                        and gaussians.bounding_box is None
+                        and iteration >= ego_prune_warmup_iter
+                        and ego_centers is not None
+                        and ego_centers.numel() > 0
+                    )
                     densify_info = gaussians.densify_and_prune(
                         args.opt, 0.005, size_threshold,
                         sensor_centers=sensor_centers,
@@ -471,6 +514,11 @@ class SceneLidar(Scene):
                         occupancy_prune_opacity_threshold=occupancy_prune_opacity_threshold,
                         dead_prune_enabled=asset_dead_prune_enabled,
                         dead_prune_min_views=dead_prune_min_views,
+                        ego_prune_enabled=asset_ego_prune_enabled,
+                        ego_centers=ego_centers if asset_ego_prune_enabled else None,
+                        ego_prune_radius=ego_prune_radius,
+                        ego_prune_height_above=ego_prune_height_above,
+                        ego_prune_height_below=ego_prune_height_below,
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
@@ -481,6 +529,7 @@ class SceneLidar(Scene):
                     prune_front_num += densify_info[6]
                     prune_occ_num += densify_info[7]
                     prune_dead_num += densify_info[8]
+                    prune_ego_num += densify_info[9]
 
                 if iteration % args.opt.opacity_reset_interval == 0 or (
                     args.model.white_background
@@ -507,4 +556,4 @@ class SceneLidar(Scene):
 
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
                 prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num,
-                prune_dead_num)
+                prune_dead_num, prune_ego_num)

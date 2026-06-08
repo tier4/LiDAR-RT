@@ -406,7 +406,12 @@ class GaussianModel:
                           occupancy_prune_enabled=False,
                           occupancy_prune_opacity_threshold=0.5,
                           dead_prune_enabled=False,
-                          dead_prune_min_views=1):
+                          dead_prune_min_views=1,
+                          ego_prune_enabled=False,
+                          ego_centers=None,
+                          ego_prune_radius=1.5,
+                          ego_prune_height_above=1.5,
+                          ego_prune_height_below=0.5):
         # When skip_densify is True, we run only the pruning steps below
         # (low-opacity, bbox-escape, min_range_prune, big-points). This lets
         # us keep cleaning up after an asset has hit its point cap, instead
@@ -434,6 +439,44 @@ class GaussianModel:
                 prune_dead_num = n_dead
                 print(f'Hard prune dead Gaussians (view_count<{dead_prune_min_views}): '
                       f'{n_dead}/{n_pre}')
+
+        # --- Ego-swept-volume hard prune (bg only). ---
+        # The ego vehicle physically occupied this space at some frame — by
+        # definition no static-scene geometry can exist there, so any bg
+        # Gaussian inside the swept volume is wrong. Use a vertical-axis
+        # cylinder around each ego pose: |Δxy| < ego_prune_radius AND
+        # -ego_prune_height_below < Δz < ego_prune_height_above. Cheaper
+        # than an oriented bbox check and a strict superset of the typical
+        # T4 vehicle envelope (radius ≈ longest-half-axis covers the OBB).
+        # Runs after dead_prune so we operate on the same survivor set.
+        prune_ego_num = 0
+        if (ego_prune_enabled and ego_centers is not None
+                and ego_centers.numel() > 0
+                and self.get_local_xyz.shape[0] > 0):
+            bg_xyz = self.get_world_xyz()  # bg has bounding_box=None
+            n_pre = bg_xyz.shape[0]
+            # Chunk over bg points so the (N, M, 2) intermediate fits — M can
+            # reach ~250 with frame interpolation; 500K × 250 × 2 × 4B = 1GB
+            # unchunked. 100K-chunk keeps peak at ~200MB.
+            chunk = 100_000
+            inside_any = torch.zeros(n_pre, dtype=torch.bool, device=bg_xyz.device)
+            ec = ego_centers.to(bg_xyz.device, dtype=bg_xyz.dtype)
+            for s in range(0, n_pre, chunk):
+                e = min(s + chunk, n_pre)
+                p = bg_xyz[s:e]  # (n, 3)
+                dxy = (p[:, None, :2] - ec[None, :, :2]).norm(dim=-1)  # (n, M)
+                dz = p[:, None, 2] - ec[None, :, 2]                     # (n, M)
+                inside = ((dxy < ego_prune_radius)
+                          & (dz > -ego_prune_height_below)
+                          & (dz < ego_prune_height_above))
+                inside_any[s:e] = inside.any(dim=-1)
+            n_ego = int(inside_any.sum().item())
+            if 0 < n_ego < n_pre:
+                self.prune_points(inside_any)
+                prune_ego_num = n_ego
+                print(f'Hard prune ego-swept (r={ego_prune_radius}m, '
+                      f'+{ego_prune_height_above}/-{ego_prune_height_below}m): '
+                      f'{n_ego}/{n_pre}')
 
         mean_grads = (self.xyz_gradient_accum / self.denom).nan_to_num(0.0).squeeze(-1)
 
@@ -636,7 +679,7 @@ class GaussianModel:
         torch.cuda.empty_cache()
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
                 prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num,
-                prune_dead_num)
+                prune_dead_num, prune_ego_num)
 
     def add_densification_stats(self, mean_grads, update_filter):
         self.xyz_gradient_accum += torch.norm(mean_grads, dim=-1, keepdim=True)

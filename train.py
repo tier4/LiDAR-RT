@@ -92,6 +92,7 @@ def training(args):
         "prune_front_sum": [],
         "prune_occ_sum": [],
         "prune_dead_sum": [],
+        "prune_ego_sum": [],
     }
     scene_id = str(args.scene_id) if isinstance(args.scene_id, int) else args.scene_id
     output_dir = os.path.join(
@@ -535,6 +536,31 @@ def training(args):
         else:
             loss_occupancy = torch.tensor(0.0, device="cuda")
 
+        # === bg scale-range regularisation ===
+        # Two-sided hinge loss on σ for bg Gaussians: penalise σ < min OR
+        # σ > max. Bg is otherwise un-regularised on scale (the box_reg_loss
+        # scale term only fires for object Gaussians with bounding_box). The
+        # min hinge stops Adam from driving _scaling toward -∞ (numerical
+        # degeneration) and complements the post-step floor at min_scale.
+        # The max hinge bounds over-extended bg surfels that smear across
+        # multiple surfaces — the failure mode behind a non-trivial chunk
+        # of the edge phantoms.
+        lambda_scale_reg = float(getattr(args.opt, "lambda_scale_reg", 0.0))
+        if lambda_scale_reg > 0:
+            scale_reg_min = float(getattr(args.opt, "scale_reg_min", 0.01))
+            scale_reg_max = float(getattr(args.opt, "scale_reg_max", 1.0))
+            bg_gs = gaussians_assets[0]
+            if bg_gs.bounding_box is None and bg_gs.get_local_xyz.shape[0] > 0:
+                sigma = bg_gs.get_scaling  # (N, 2) — surfel σ_x, σ_y
+                too_small = (scale_reg_min - sigma).clamp_min(0.0)
+                too_large = (sigma - scale_reg_max).clamp_min(0.0)
+                loss_scale_reg = lambda_scale_reg * (
+                    too_small.mean() + too_large.mean())
+            else:
+                loss_scale_reg = torch.tensor(0.0, device="cuda")
+        else:
+            loss_scale_reg = torch.tensor(0.0, device="cuda")
+
         # === Edge-ray allowed-depth loss ===
         # Distance from rendered_depth at edge pixels to the nearest allowed
         # interval (precomputed per (sensor, frame, edge pixel)). Catches
@@ -551,7 +577,7 @@ def training(args):
         else:
             loss_edge_ray = torch.tensor(0.0, device="cuda")
 
-        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace + loss_occupancy + loss_front_acc + loss_stack + loss_edge_ray
+        loss = loss_depth + loss_intensity + loss_raydrop + loss_cd + loss_reg + loss_sky + loss_freespace + loss_occupancy + loss_front_acc + loss_stack + loss_edge_ray + loss_scale_reg
 
         # Skip iteration if loss is NaN/Inf (numerical instability in tracer)
         if not torch.isfinite(loss):
@@ -641,6 +667,11 @@ def training(args):
                 if log.get("prune_dead_sum")
                 else densify_info[8]
             )
+            prune_ego_sum = (
+                densify_info[9] + log["prune_ego_sum"][-1]
+                if log.get("prune_ego_sum")
+                else densify_info[9]
+            )
             log["depth_mse"].append(depth_mse)
             log["points_num"].append(points_num)
             log["clone_sum"].append(clone_sum)
@@ -652,6 +683,7 @@ def training(args):
             log.setdefault("prune_front_sum", []).append(prune_front_sum)
             log.setdefault("prune_occ_sum", []).append(prune_occ_sum)
             log.setdefault("prune_dead_sum", []).append(prune_dead_sum)
+            log.setdefault("prune_ego_sum", []).append(prune_ego_sum)
 
             # prepare loss stats for tensorboard record
             loss_stats = {
@@ -739,6 +771,8 @@ def training(args):
                         "train/occupancy_loss": loss_occupancy.item(),
                         # Per-edge-ray allowed-depth supervision
                         "train/edge_ray_loss": loss_edge_ray.item(),
+                        # bg scale-range regulariser
+                        "train/scale_reg_loss": loss_scale_reg.item(),
                         # Densification
                         "train/points_num": points_num,
                         "train/clone_sum": clone_sum,
@@ -750,6 +784,7 @@ def training(args):
                         "train/prune_front_sum": prune_front_sum,
                         "train/prune_occ_sum": prune_occ_sum,
                         "train/prune_dead_sum": prune_dead_sum,
+                        "train/prune_ego_sum": prune_ego_sum,
                         # Learning rate
                         "train/lr_xyz": gaussians_assets[0].optimizer.param_groups[0]["lr"],
                     },
@@ -1361,6 +1396,13 @@ if __name__ == "__main__":
     parser.add_argument("--edge_ray_dist_threshold", type=float, default=None)
     parser.add_argument("--edge_ray_warmup_iter", type=int, default=None)
     parser.add_argument("--edge_ray_max_loss_dist", type=float, default=None)
+    parser.add_argument("--lambda_scale_reg", type=float, default=None)
+    parser.add_argument("--scale_reg_min", type=float, default=None)
+    parser.add_argument("--scale_reg_max", type=float, default=None)
+    parser.add_argument("--ego_prune_enabled", type=int, default=None,
+                        help="0/1 toggle for ego-swept-volume hard prune")
+    parser.add_argument("--ego_prune_radius", type=float, default=None)
+    parser.add_argument("--ego_prune_warmup_iter", type=int, default=None)
     parser.add_argument("--exp_suffix", type=str, default="",
                         help="Append to exp_name (use to keep sweep run dirs distinct)")
     launch_args = parser.parse_args()
@@ -1398,6 +1440,15 @@ if __name__ == "__main__":
         "edge_ray_dist_threshold": launch_args.edge_ray_dist_threshold,
         "edge_ray_warmup_iter": launch_args.edge_ray_warmup_iter,
         "edge_ray_max_loss_dist": launch_args.edge_ray_max_loss_dist,
+        # Bg scale-range regulariser
+        "lambda_scale_reg": launch_args.lambda_scale_reg,
+        "scale_reg_min": launch_args.scale_reg_min,
+        "scale_reg_max": launch_args.scale_reg_max,
+        # Ego-swept-volume hard prune
+        "ego_prune_enabled": (None if launch_args.ego_prune_enabled is None
+                              else bool(launch_args.ego_prune_enabled)),
+        "ego_prune_radius": launch_args.ego_prune_radius,
+        "ego_prune_warmup_iter": launch_args.ego_prune_warmup_iter,
     }
     for k, v in opt_overrides.items():
         if v is not None:
