@@ -37,11 +37,17 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 
-def _compute_edge_mask(gt_depth, gt_mask, edge_depth_grad_thresh):
+def _compute_edge_mask(gt_depth, gt_mask, edge_depth_grad_thresh,
+                       dilate_px=0):
     """Mirror of the edge_mask construction in train.py:309-340.
 
-    Edge_mask = (Sobel-edge with valid 3x3 neighbourhood) ∪ (sky boundary).
-    Operates on the same device as the input tensors.
+    Edge_mask = (Sobel-edge with valid 3x3 neighbourhood) ∪ (sky boundary),
+    optionally dilated by `dilate_px` pixels (max_pool2d with kernel
+    2*dilate_px+1). Dilation lets the mask reach into no-return-side
+    pixels adjacent to depth discontinuities — phantom analysis on
+    ckpt_it_8000 showed ~95% of phantom hits land at dist=1 px from the
+    undilated edge band, i.e. just outside it. Dilation pulls those
+    pixels into the loss's activation region.
     """
     gt_d = gt_depth.unsqueeze(0).unsqueeze(0).float()
     sx = torch.tensor(
@@ -56,7 +62,14 @@ def _compute_edge_mask(gt_depth, gt_mask, edge_depth_grad_thresh):
     any_invalid = F.max_pool2d(invalid, 3, stride=1, padding=1).squeeze() > 0.5
     sobel_edge = (edge_mag > edge_depth_grad_thresh) & ~any_invalid & gt_mask
     sky_boundary = any_invalid & gt_mask
-    return sobel_edge | sky_boundary
+    edge = sobel_edge | sky_boundary
+
+    if dilate_px > 0:
+        k = 2 * int(dilate_px) + 1
+        edge_in = edge.float().unsqueeze(0).unsqueeze(0)
+        edge = F.max_pool2d(edge_in, k, stride=1, padding=int(dilate_px)) \
+            .squeeze() > 0.5
+    return edge
 
 
 def _intervals_from_mask(allowed_1d, depths_1d):
@@ -96,13 +109,15 @@ class EdgeRayAllowed:
                  min_depth=0.5,
                  max_depth=100.0,
                  edge_depth_grad_thresh=15.0,
-                 max_intervals_per_pixel=5):
+                 max_intervals_per_pixel=5,
+                 mask_dilate_px=0):
         self.dist_threshold = float(dist_threshold)
         self.num_samples = int(num_samples)
         self.min_depth = float(min_depth)
         self.max_depth = float(max_depth)
         self.edge_depth_grad_thresh = float(edge_depth_grad_thresh)
         self.max_intervals_per_pixel = int(max_intervals_per_pixel)
+        self.mask_dilate_px = int(mask_dilate_px)
         # dict[(sensor_name, frame_id)] -> dict of tensors
         self._data = {}
         self._stats = {}
@@ -118,6 +133,7 @@ class EdgeRayAllowed:
         h.update(f"{self.min_depth}".encode())
         h.update(f"{self.max_depth}".encode())
         h.update(f"{self.edge_depth_grad_thresh}".encode())
+        h.update(f"dilate={self.mask_dilate_px}".encode())
         if cache_extra:
             for k in sorted(cache_extra.keys()):
                 h.update(f"{k}={cache_extra[k]}".encode())
@@ -189,7 +205,8 @@ class EdgeRayAllowed:
                 gt_depth = lidar.get_depth(fid).cuda()
                 gt_mask = lidar.get_mask(fid).cuda()
                 edge_mask = _compute_edge_mask(
-                    gt_depth, gt_mask, self.edge_depth_grad_thresh)
+                    gt_depth, gt_mask, self.edge_depth_grad_thresh,
+                    dilate_px=self.mask_dilate_px)
                 if not edge_mask.any():
                     continue
                 H, W = gt_depth.shape
@@ -253,6 +270,7 @@ class EdgeRayAllowed:
             "dist_threshold": self.dist_threshold,
             "num_samples": self.num_samples,
             "edge_depth_grad_thresh": self.edge_depth_grad_thresh,
+            "mask_dilate_px": self.mask_dilate_px,
         }
 
     def get_frame_data(self, sensor_name, frame_id):

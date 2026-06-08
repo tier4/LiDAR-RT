@@ -83,16 +83,84 @@ opt:
 
   lambda_normal: 0.00
   lambda_cd: 0.01
-  lambda_depth_l1: 0.5
-  lambda_intensity_l1: 0.85
+  # Rebalanced 2026-06-08 (second pass) against wandb runs llbhzw64 /
+  # 697c9hvs. The first rebalance (depth_l1 0.5→1.0, intensity halved)
+  # cut intensity's share from 67% to 37% but edge geometry actually
+  # degraded (stack_loss +26%, front_acc +12%, phantom_pixels +8%) —
+  # the photometric DSSIM was carrying more structural signal than
+  # intensity L1 alone. Second pass: add depth-side DSSIM (= the proper
+  # structural signal for what we want) and cut intensity further so
+  # the model unambiguously prioritises geometric fit.
+  # Expected new composition (using 697c9hvs raw losses @ iter 4K):
+  #   depth_l1 ~3.14 (~72%), depth_dssim ~0.16 (~4%), intensity_l1+dssim
+  #   ~0.53 (~12%), stack ~0.34 (~8%), sky ~0.19 (~4%), front_acc ~0.04
+  #   (~1%). Depth occupies ~76% of the gradient signal.
+  lambda_depth_l1: 1.0
+  # Direct structural-similarity loss on log-normalised depth (window=11x11).
+  # Catches "stacked phantom" patterns (many thin Gaussians at slightly
+  # different depths around an edge) that depth L1 cannot see.
+  # Log-normalisation: depth → log1p(d)/log1p(max_depth) — compresses
+  # far-range, amplifies near-range where LiDAR phantoms cluster.
+  # 0 disables.
+  lambda_depth_dssim: 2.0   # was 0.10 — at iter-8000 (1-SSIM)≈0.08 →
+                            # contribution ≈ 0.16, comparable to stack_loss.
+                            # Naturally grows in relative importance as
+                            # depth_l1 converges (l1 → 0 faster than
+                            # 1-SSIM), giving a graceful "rough fit then
+                            # structural refinement" curriculum.
+  # L1 on rendered hits at no-return pixels, target = max_depth.
+  # depth_l1 only fires on gt_mask=True, so the "no-return side of an
+  # edge" (= sky pixel adjacent to a building edge) has zero depth-side
+  # gradient under vanilla losses. analyze_edge_sky_regions.py on iter
+  # 25K showed this 3% area holds 96% of all sky-side phantom hits
+  # (29.1% phantom rate vs 0.26% in open-sky regions, density ratio
+  # 113.7x). lambda_sky also targets this region but minimises depth →
+  # 0 which creates a near-range "safe zone" (sky_loss formulation
+  # discussion in commit 9ec9fc8). Targeting max_depth pushes phantoms
+  # in the right direction (away). Clamp prevents one far-off rogue
+  # phantom from dominating the gradient.
+  lambda_no_return_l1: 0.1    # Dry-run on iter-25K ckpt showed mean clamped
+                              # err saturates near the cap (~19.9 m) initially
+                              # because phantoms sit at ~45-55m vs target 200m.
+                              # At λ=0.5 the contribution was ~10/iter,
+                              # dominating depth_l1 (~1.7). 0.1 gives ~2/iter
+                              # = same order as depth_l1, decaying naturally
+                              # toward 0 as phantoms migrate to max_depth.
+                              # Sweep candidate: [0.05, 0.1, 0.2, 0.5].
+  no_return_l1_max_err: 20.0  # Huber-style cap. A phantom at rd=5m with
+                              # target=200m has raw err=195m; clamping to
+                              # 20m keeps the gradient bounded.
+  lambda_intensity_l1: 0.1    # was 0.4 (originally 0.85). Geometry is the
+                              # primary task, intensity is auxiliary.
   lambda_intensity_l2: 0.0
-  lambda_intensity_dssim: 0.15
+  lambda_intensity_dssim: 0.025  # was 0.075 — cut in line with L1 so
+                                  # intensity in total occupies ~12% of
+                                  # the gradient. Kept non-zero because
+                                  # the UNet raydrop refinement (stage 2)
+                                  # needs a sensible rendered intensity
+                                  # signal at hand-off.
   lambda_raydrop_bce: 0.01
   lambda_reg: 0.1
+  # Held at 0.02. Earlier (2026-06-08 evening) I hypothesised sky_loss
+  # was structurally pathological — formulation is
+  # `lambda * mean(rendered_depth at sky-hit pixels)`, which I argued
+  # only pulls phantom depths toward 0 without reducing α. Empirical
+  # check (run d0hasa77 → sky-disabled follow-up) showed the depth
+  # image visibly degraded with lambda_sky=0, so the hypothesis was
+  # wrong. The likely missing piece in my analysis: rendered depth is
+  # α-weighted (Σαᵢ Tᵢ dᵢ / Σαᵢ Tᵢ), so reducing the weighted average
+  # CAN be achieved by reducing α of far phantoms — even with the
+  # apparent "depth-pulling" failure mode, the α reduction does
+  # happen. front_acc by itself is not a full replacement.
   lambda_sky: 0.02
   lambda_freespace: 0.0   # Replaced by lambda_front_acc (covers sky rays via target_depth=∞ sentinel).
                           # Set to 0 to turn the old sky-only freespace loss off.
-  lambda_front_acc: 0.05  # Penalise alpha accumulated strictly in front of GT hit (or ∞ for sky).
+  lambda_front_acc: 0.10  # was 0.05 — same run showed front_acc only
+                          # carried ~0.25% of total loss. Doubling brings
+                          # it to ~0.5% and gives more bite to the no-return
+                          # phantom band once edge_mask_dilate_px=1 sweeps
+                          # those pixels into the 1.5x edge boost.
+                          # Penalise alpha accumulated strictly in front of GT hit (or ∞ for sky).
                           # Front-side accumulation loss: directly attacks horizon-ring phantoms
                           # on hit rays that the sky-only freespace loss cannot see.
 
@@ -124,6 +192,23 @@ opt:
                                 # (observed 2.57M points by iter 3K with
                                 # boost=2.0). 0.5 keeps the anti-phantom
                                 # signal while throttling over-densify.
+  # Dilate the edge_mask (sobel_edge | sky_boundary) by N pixels via
+  # max_pool2d before the edge_weight / stack_loss filter is applied.
+  # Ghost analysis on ckpt_it_8000 (output/ghost_edge_8000/per_bin.csv)
+  # found phantom hits cluster at dist=1 px from the undilated band —
+  # 95% sit on the no-return side one pixel beyond it. Dilating sweeps
+  # those pixels into:
+  #   - front_acc edge-boost: weighted_acc = accum_at_target * edge_weight,
+  #       and target_depth=1e6 on no-return pixels → snapshot covers the
+  #       whole ray, so boost flows through to phantoms there.
+  #   - stack_loss gating: excess[edge_mask].mean() — dilated no-return
+  #       pixels with ≥2 contributors get penalised as stacked phantoms.
+  # depth_l1 is still filtered by [gt_mask].mean() so its boost only
+  # widens on the valid side (covers the dist=1 high-err band, ~21% of
+  # all >1m errors); it cannot reach phantoms by design — front_acc /
+  # stack are the channels that do.
+  # 0 disables (back-compat with pre-2026-06-08 behaviour).
+  edge_mask_dilate_px: 1
 
   # Stack loss (B): kernel-level soft contributor count per pixel +
   # edge-restricted L1 on (n_contributors - 1). Directly targets the
@@ -137,31 +222,15 @@ opt:
                                      # past 0.10.
   contributor_alpha_threshold: 0.1   # sigmoid midpoint over alpha
   contributor_alpha_sharpness: 50.0  # higher → step-like
-  # === Per-edge-ray allowed-depth loss ===
-  # For each edge pixel (sobel_edge | sky_boundary) we precompute the depth
-  # ranges along the ray that are within `edge_ray_dist_threshold` of any
-  # GT point (union of all train frames' bg GT). At training time the
-  # rendered depth at edge pixels is penalised by its distance to the
-  # nearest allowed interval. This is RAY-LOCAL — catches midair phantoms
-  # that chamfer (ray-agnostic) and front_acc (front-only) miss.
-  # See lib/scene/edge_ray_allowed.py for full rationale.
-  # First run with this enabled triggers ~5-15 min one-shot cache build;
-  # subsequent runs load the disk cache in <1 s.
-  #
-  # Starting weight 0.03: comparable magnitude to stack/front_acc on the
-  # phantom-pixel objective. Per-pixel loss is L1 distance in metres
-  # (clamped 0-10), so a typical mean of ~1-3 m gives loss contribution
-  # ~0.03-0.09 — same order as stack (~0.03) but well below depth_l1
-  # (~0.5). Tune to 0.05-0.10 if effect is too subtle, but verify
-  # eval/total_phantom_pixels does drop first.
-  lambda_edge_ray_allowed: 0.03
-  edge_ray_dist_threshold: 0.5     # m; samples within this of GT cloud = allowed
-  edge_ray_num_samples: 100        # log-spaced 0.5-100m
-  edge_ray_min_depth: 0.5
-  edge_ray_max_depth: 100.0
-  edge_ray_max_intervals_per_pixel: 5
-  edge_ray_warmup_iter: 3000       # gate until densification has settled
-  edge_ray_max_loss_dist: 10.0     # per-pixel L1 distance clamp (Huber-style cap)
+
+  # Per-edge-ray allowed-depth loss (lib/scene/edge_ray_allowed.py) was
+  # tried 2026-06-05..08 with mask_dilate_px=1 informed by ghost analysis
+  # (output/ghost_edge_8000/per_bin.csv) — effect on phantom metric was
+  # too small to justify the 5-15 min cache build and the per-step
+  # overhead. Code path is dormant while `lambda_edge_ray_allowed` is
+  # unset (train.py:219 gates the entire build on `lambda > 0`).
+  # Re-enable by adding `lambda_edge_ray_allowed: 0.03` (and any other
+  # edge_ray_* overrides) back to this file.
 
   lambda_occupancy: 0.05  # Penalise opacity of bg Gaussians sitting in voxels no LiDAR return ever hit
   occupancy_voxel_size: 0.1    # World-frame voxel size (m) for the occupancy grid
@@ -189,8 +258,23 @@ opt:
   # densify_and_prune so fresh clone/split spawns (vc=0 by construction)
   # aren't mistakenly culled.
   dead_prune_enabled: true
-  dead_prune_warmup_iter: 3000     # let densify settle before the first sweep
-  dead_prune_min_views: 1          # 0 observations across the cycle → kill
+  # Staggered warmups (2026-06-08, post-sds9rkol audit). The run showed
+  # bg population dropped 858K → 461K in ONE densify cycle (iter 3000
+  # → 3100) when dead+front+sky prunes all woke up simultaneously at
+  # warmup_iter=3000 — a 46% wipeout that took 12K iter to recover
+  # from. Spacing the warmups by 2K (= 20 densify cycles) per stage
+  # spreads the wave into three smaller drops instead of one cliff.
+  # Order: dead first (kills unambiguously inert mass), then front
+  # (needs front_acc accum data, which warms up by iter ~5K), then
+  # sky (slowest to converge — view-consistency requires multiple
+  # observations).
+  dead_prune_warmup_iter: 3000     # baseline; densify_until_iter=15K leaves
+                                    # 12K cycles for the dead-only sweep to
+                                    # work before front/sky come in
+  dead_prune_min_views: 1          # OK as is: 1 densify cycle ≈ 100 iter ≈
+                                    # 2.3 epoch over 43 train frames → a
+                                    # Gaussian needs to be invisible across
+                                    # ~100 frame samples to be killed
   dead_prune_min_contrib: 0.001    # per-frame α·T threshold to count as "observed"
 
   # Ego-swept-volume hard prune (bg only, OBB). The ego vehicle physically
@@ -214,7 +298,13 @@ opt:
   #      max_y =  (wheel_tread/2 + left_overhang)     =  0.8475
   #      min_z = 0, max_z = vehicle_height            =  2.5
   #   mirror.param.yaml: min/max longitudinal/lateral/height offsets used verbatim.
-  ego_prune_enabled: true
+  # Disabled 2026-06-08: empirically worsened eval metrics — likely
+  # killing legitimate near-body returns (low overhanging branches /
+  # tunnel ceilings / mirror reflections of nearby Gaussians) along with
+  # the intended interior phantoms. The swept-volume assumption was too
+  # strict for this scene. Bbox defaults below stay so we can re-enable
+  # quickly by flipping this flag.
+  ego_prune_enabled: false
   ego_prune_warmup_iter: 1500           # same as densify_from_iter — only
                                         # prunes after PCD seeds had a chance
                                         # to migrate out of the swept volume
@@ -244,13 +334,29 @@ opt:
   # penalty = mean( clamp(min - σ, 0) ) + mean( clamp(σ - max, 0) ).
   # Pulls σ into [min, max] without penalising values inside the band.
   # Bg is otherwise un-regularised — the box_reg_loss scale term only
-  # fires for object Gaussians (with bounding_box). Initial PCD voxel
-  # size is 0.15m → typical bg σ ≈ 0.1m, so [0.01, 1.0] m gives a wide
-  # acceptance band that only catches degenerate / over-extended cases.
-  lambda_scale_reg: 0.02
-  scale_reg_min: 0.01              # m, soft floor (per-step _scaling clamp at
-                                   # min_scale=1e-6 is the hard floor)
-  scale_reg_max: 1.0               # m, soft ceiling
+  # fires for object Gaussians (with bounding_box).
+  #
+  # Tightened 2026-06-08 (after iter-25K bg distribution audit):
+  # analyze_gaussian_stats.py on model_it_25000.pth showed 27.7% of bg
+  # Gaussians had σ_max < 1cm (below the OLD scale_reg_min=0.01) and
+  # 66.6% had σ_max < 3cm — i.e. roughly two thirds were geometrically
+  # below the PCD voxel size (15cm) yet kept α=1.0 and so survived all
+  # prune mechanisms. A 5mm surfel at 30m subtends 1e-4 rad while a
+  # Hesai-OT128 beam covers ~1.7e-3 rad, so these tiny stubs can't
+  # cover even one full beam footprint — they're capacity waste that
+  # also worsens edge-pixel averaging (more contributors per ray =
+  # higher stack_loss). The old (0.02, 0.01) settings were too lax:
+  # at λ=0.02 a 5mm Gaussian's hinge penalty was ~0.0001, weaker than
+  # the depth gradient pull that produced it. 5x stronger λ + 3x
+  # higher floor forces the bottom 27% of the population to either
+  # grow into the useful band or get eliminated by other prunes.
+  lambda_scale_reg: 0.10   # was 0.02
+  scale_reg_min: 0.03      # was 0.01 — match PCD voxel order (15cm/5)
+                           # and set above the Hesai beam footprint at
+                           # close range (~3cm at 2m). Hard per-step
+                           # clamp at min_scale=1e-6 stays as a safety
+                           # net for numerical degeneracy.
+  scale_reg_max: 1.0       # m, soft ceiling (unchanged)
 
   occupancy_prune_enabled: false  # Disabled in favour of edge_loss_boost + lambda_stack
                                   # which target edge phantoms at the source (densification)
@@ -272,7 +378,10 @@ opt:
   # fraction of those views judging it "sky" exceeds
   # sky_prune_view_consistency_threshold.
   sky_prune_enabled: true
-  sky_prune_warmup_iter: 3000           # Gate the path until densification has settled
+  sky_prune_warmup_iter: 7000           # Was 3000 — staggered to land after
+                                         # dead_prune (3K) and front_prune (5K)
+                                         # have stabilised the population.
+                                         # See dead_prune comment for context.
   sky_prune_pixel_ratio_threshold: 0.8  # per-view sky/total ratio to judge "sky"
   sky_prune_min_total_contrib: 0.001    # ignore Gaussians barely contributing this view
   sky_prune_view_consistency_threshold: 0.8  # fraction of observed views that must agree
@@ -305,7 +414,10 @@ opt:
   # net. Uses the same accum_gaussian_front_weights per-Gaussian signal
   # the kernel records (forward.cu) for target_depth-supplied views.
   front_prune_enabled: true
-  front_prune_warmup_iter: 3000
+  front_prune_warmup_iter: 5000     # Was 3000 — staggered to land 2K after
+                                     # dead_prune. front_acc accumulator
+                                     # signal is meaningful by iter ~4-5K so
+                                     # this is also the natural lower bound.
   front_prune_pixel_ratio_threshold: 0.8       # per-view front/total to judge "front"
   front_prune_min_total_contrib: 0.001          # ignore Gaussians barely contributing
   front_prune_view_consistency_threshold: 0.8  # fraction of views that must agree

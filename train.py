@@ -122,6 +122,9 @@ def training(args):
             "lr_scaling": getattr(args.opt, "scaling_lr", None),
             "lr_rotation": getattr(args.opt, "rotation_lr", None),
             "lambda_depth_l1": getattr(args.opt, "lambda_depth_l1", None),
+            "lambda_depth_dssim": getattr(args.opt, "lambda_depth_dssim", None),
+            "lambda_no_return_l1": getattr(args.opt, "lambda_no_return_l1", None),
+            "no_return_l1_max_err": getattr(args.opt, "no_return_l1_max_err", None),
             "lambda_intensity_l1": getattr(args.opt, "lambda_intensity_l1", None),
             "lambda_intensity_l2": getattr(args.opt, "lambda_intensity_l2", None),
             "lambda_intensity_dssim": getattr(args.opt, "lambda_intensity_dssim", None),
@@ -227,6 +230,8 @@ def training(args):
                 args.opt, "edge_depth_grad_thresh", 15.0)),
             max_intervals_per_pixel=int(getattr(
                 args.opt, "edge_ray_max_intervals_per_pixel", 5)),
+            mask_dilate_px=int(getattr(
+                args.opt, "edge_ray_mask_dilate_px", 0)),
         )
         era_cache_dir = os.path.join(args.model_dir, ".edge_ray_allowed_cache")
         era_stats = edge_ray_allowed.build_or_load_cache(
@@ -239,6 +244,7 @@ def training(args):
         era_tag = "(cached)" if era_stats.get("cached") else "(built)"
         print(f"[EdgeRayAllowed] {era_tag} "
               f"dist_threshold={era_stats['dist_threshold']:.2f}m  "
+              f"dilate={era_stats.get('mask_dilate_px', 0)}px  "
               f"frames={era_stats['n_frames']}  "
               f"edge_pixels={era_stats['n_edge_pixels']:,}  "
               f"intervals={era_stats['n_intervals_total']:,}")
@@ -379,6 +385,26 @@ def training(args):
                 # one invalid neighbour. Independent of any depth value.
                 sky_boundary = any_invalid & gt_mask
                 edge_mask = sobel_edge | sky_boundary
+                # (C) Optional dilation by N pixels (max_pool2d). Ghost
+                # analysis on ckpt_it_8000 (output/ghost_edge_8000/
+                # per_bin.csv) showed phantom hits cluster at dist=1 px
+                # from the undilated band — 95% sit on the no-return side
+                # one pixel beyond it. Dilating sweeps those pixels into
+                # the front_acc edge-boost and the lambda_stack gating
+                # (both apply to no-return pixels: front_acc snapshots
+                # alpha through target=1e6, stack_loss uses edge_mask as
+                # a plain pixel filter). Note depth_l1 is filtered by
+                # [gt_mask].mean() so its boost only widens on the
+                # valid side — that still captures the dist=1 high-err
+                # band (~21% of all >1m errors) but not phantoms.
+                edge_dilate = int(getattr(
+                    args.opt, "edge_mask_dilate_px", 0))
+                if edge_dilate > 0:
+                    k = 2 * edge_dilate + 1
+                    em_f = edge_mask.float().unsqueeze(0).unsqueeze(0)
+                    edge_mask = F.max_pool2d(
+                        em_f, k, stride=1, padding=edge_dilate,
+                    ).squeeze() > 0.5
             edge_weight = 1.0 + edge_loss_boost * edge_mask.float()
         else:
             edge_mask = torch.zeros_like(gt_mask, dtype=torch.bool)
@@ -393,6 +419,80 @@ def training(args):
             loss_depth = args.opt.lambda_depth_l1 * l1_loss(
                 depth[gt_mask], gt_depth[gt_mask]
             )
+
+        # === Depth structural-similarity loss (log-normalised) ===
+        # Direct structural signal on the depth image. Catches the
+        # "stacked phantom" failure mode (many thin Gaussians at slightly
+        # different depths around an edge) that depth L1 alone cannot
+        # see — L1 only enforces per-pixel proximity to GT depth, while
+        # SSIM penalises local variance/covariance mismatches across an
+        # 11x11 window. Previously this signal came indirectly through
+        # intensity DSSIM (intensity edges correlate with depth edges in
+        # urban scenes); halving intensity_dssim weakened it, hence the
+        # explicit depth-side DSSIM here.
+        # Log-normalisation maps depth ∈ [0, max_depth] → [0, 1] with
+        # near-range compressed less than far-range, matching where
+        # phantom artefacts cluster (LiDAR scenes: near-range phantoms
+        # dominate) and the colourmap used in vis_rerun.py.
+        lambda_depth_dssim = float(getattr(args.opt, "lambda_depth_dssim", 0.0))
+        if lambda_depth_dssim > 0:
+            log_max = float(np.log1p(getattr(args, "max_depth", 200.0)))
+            # Mask no-return pixels to 0 in both maps so the SSIM window
+            # sees identical zeros there (no penalty). Mirrors the
+            # intensity-DSSIM construction at lines 432-434.
+            d_n = (torch.log1p(depth.clamp_min(0)) / log_max) * gt_mask.float()
+            gt_n = (torch.log1p(gt_depth.clamp_min(0)) / log_max) * gt_mask.float()
+            loss_depth_dssim = lambda_depth_dssim * (
+                1 - ssim(d_n.unsqueeze(0).unsqueeze(0),
+                         gt_n.unsqueeze(0).unsqueeze(0))
+            )
+            loss_depth = loss_depth + loss_depth_dssim
+        else:
+            loss_depth_dssim = torch.tensor(0.0, device="cuda")
+
+        # === No-return-pixel depth L1 (push rendered hits toward max_depth) ===
+        # Targeted at the "edge_sky" region — pixels with gt_mask=False that
+        # are right next to a depth-discontinuity edge (= the no-return side
+        # of a building edge). analyze_edge_sky_regions.py on iter-25K ckpt
+        # showed: ~96% of sky-side phantoms (5.99K of 6.24K) sit in just 3%
+        # of the image area there, with mean rd_depth ≈ 56m even though the
+        # "correct" target is ∞ (no return).
+        #
+        # The legacy depth_l1 is gated by [gt_mask] so this region receives
+        # zero depth-side gradient. lambda_sky tried to fill the gap with
+        # `mean(rd_depth)` but its minimum is at depth=0 — creating a
+        # close-range "safe zone" where phantoms migrate to <1m. This loss
+        # uses the principled formulation instead:
+        #
+        #   L = λ * mean( clamp(max_depth - rd_depth, 0, max_err) )_phantom_sky
+        #
+        # — minimum is at rd_depth = max_depth, so the gradient pushes
+        # phantoms AWAY from the sensor (no close-range trap). The clamp on
+        # max_err prevents a single rogue phantom (e.g. rd=2m, target=200m
+        # → err=198m) from dominating the gradient.
+        lambda_no_return_l1 = float(
+            getattr(args.opt, "lambda_no_return_l1", 0.0))
+        if lambda_no_return_l1 > 0:
+            # No-return pixel where rasterizer still rendered a hit.
+            # We use depth>0 as the "rendered hit" indicator (any Gaussian
+            # along the ray accumulated some α·T·d). Predicted raydrop is
+            # NOT used to gate — the goal is to suppress the underlying
+            # Gaussians regardless of whether the UNet eventually masks them.
+            sky_phantom = (~gt_mask) & (depth > 0)
+            if sky_phantom.any():
+                max_depth = float(getattr(args, "max_depth", 200.0))
+                max_err = float(getattr(
+                    args.opt, "no_return_l1_max_err", 20.0))
+                # clamp at 0 lower bound because rd_depth ≤ max_depth always
+                # (rasterizer hit can't exceed scene extent); upper clamp is
+                # the Huber-style cap.
+                err = (max_depth - depth).clamp(0.0, max_err)
+                loss_no_return = lambda_no_return_l1 * err[sky_phantom].mean()
+            else:
+                loss_no_return = torch.tensor(0.0, device="cuda")
+            loss_depth = loss_depth + loss_no_return
+        else:
+            loss_no_return = torch.tensor(0.0, device="cuda")
 
         # === Intensity loss ===
         intensity = intensity.squeeze(-1)
@@ -744,6 +844,8 @@ def training(args):
                         "train/ema_loss": (0.4 * loss + 0.6 * ema_loss_for_log).item(),
                         # Depth
                         "train/depth_loss": loss_depth.item(),
+                        "train/depth_dssim_loss": loss_depth_dssim.item(),
+                        "train/no_return_l1_loss": loss_no_return.item(),
                         "train/depth_mse": depth_mse,
                         "train/depth_rmse": depth_rmse,
                         "train/depth_mae": depth_mae,
@@ -1388,6 +1490,15 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_freespace", type=float, default=None)
     parser.add_argument("--lambda_front_acc", type=float, default=None)
     parser.add_argument("--lambda_sky", type=float, default=None)
+    parser.add_argument("--lambda_depth_dssim", type=float, default=None,
+                        help="DSSIM loss on log-normalised depth (0 disables)")
+    parser.add_argument("--lambda_no_return_l1", type=float, default=None,
+                        help="L1 loss pushing rendered hits on no-return pixels "
+                             "toward max_depth (0 disables). Targets edge_sky "
+                             "phantoms supervised by nothing in vanilla L1.")
+    parser.add_argument("--no_return_l1_max_err", type=float, default=None,
+                        help="Per-pixel clamp on (max_depth - rd_depth) used "
+                             "by lambda_no_return_l1 (Huber-style cap).")
     # Densification / prune dynamics overrides — used by the
     # densification-focused sweep yaml. Each falls back to the config
     # value when not passed.
@@ -1434,6 +1545,9 @@ if __name__ == "__main__":
         "lambda_freespace": launch_args.lambda_freespace,
         "lambda_front_acc": launch_args.lambda_front_acc,
         "lambda_sky": launch_args.lambda_sky,
+        "lambda_depth_dssim": launch_args.lambda_depth_dssim,
+        "lambda_no_return_l1": launch_args.lambda_no_return_l1,
+        "no_return_l1_max_err": launch_args.no_return_l1_max_err,
         # Densification / prune dynamics
         "densify_grad_threshold": launch_args.densify_grad_threshold,
         "opacity_reset_interval": launch_args.opacity_reset_interval,
