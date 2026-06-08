@@ -445,14 +445,15 @@ def main():
 
     # --- Ego-prune swept-volume visualisation ---
     # Renders the ego OBB(s) at every cached pose (base + interpolated) as
-    # translucent red boxes under world/ego_prune. This is the volume where
-    # bg Gaussians should not exist (and are hard-pruned every densify
-    # cycle by the ego-prune path in densify_and_prune). Useful for
-    # eyeballing whether a remaining bg ellipsoid sits inside the swept
-    # volume — should be 0 after iter 1600.
+    # translucent red boxes under world/ego_prune. The volume where bg
+    # Gaussians should not exist (and are hard-pruned every densify cycle
+    # by the ego-prune path in densify_and_prune). Useful for eyeballing
+    # whether a remaining bg ellipsoid sits inside the swept volume —
+    # should be 0 after iter 1600. Flip the flag to True when needed.
+    SHOW_EGO_PRUNE_BOXES = False
     try:
         ego_prune_enabled_cfg = bool(getattr(args.opt, "ego_prune_enabled", False))
-        if ego_prune_enabled_cfg:
+        if SHOW_EGO_PRUNE_BOXES and ego_prune_enabled_cfg:
             # Mirror the (base + 5 interp/segment) cache from gs_loader.optimize.
             base_poses = []
             for sname, lidar in lidars.items():
