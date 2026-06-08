@@ -224,6 +224,22 @@ opt:
     # side mirrors (from mirror.param.yaml)
     - [ 2.84,   -1.03,   0.86,   3.16, 1.03,   1.22]
 
+  # Oversized force-split (bg only). The standard densify_and_split path
+  # requires (grad >= densify_grad_threshold) AND (max_scale > scale_thr) —
+  # a Gaussian that's too big but has converged grad never gets split, so
+  # it sits there smearing across surfaces. This force-splits any Gaussian
+  # whose max σ exceeds `oversized_split_max_scale` IGNORING gradient.
+  # Each candidate becomes 2 children at perturbed positions with
+  # σ ← σ / (0.8 * 2) = σ / 1.6 each. Net +1 per split.
+  #
+  # Layered design with lambda_scale_reg:
+  #   σ ≤ scale_reg_max  (1.0 m): no penalty
+  #   σ ∈ (1.0, 1.5] m:           soft scale_reg pushes σ down
+  #   σ > oversized_split_max_scale (1.5 m): hard split
+  oversized_split_enabled: true
+  oversized_split_max_scale: 1.5      # m, slightly above scale_reg_max
+  oversized_split_warmup_iter: 1500   # same gate as densify_from_iter
+
   # Bg scale-range regulariser. Two-sided hinge loss on σ (per-axis):
   # penalty = mean( clamp(min - σ, 0) ) + mean( clamp(σ - max, 0) ).
   # Pulls σ into [min, max] without penalising values inside the band.

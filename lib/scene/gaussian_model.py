@@ -374,6 +374,47 @@ class GaussianModel:
         self.prune_points(prune_filter)
         return num
 
+    def densify_oversized_split(self, max_scale_threshold, N=2):
+        """Force-split Gaussians whose max σ exceeds threshold, IGNORING
+        the gradient gate. Catches the failure mode where a large surfel
+        sits across multiple surfaces but doesn't accumulate enough
+        gradient to trigger densify_and_split, so the standard clone/split
+        path leaves it alone forever. Each candidate becomes N child
+        Gaussians at perturbed positions with σ ← σ / (0.8 * N) each.
+        Otherwise identical to densify_and_split.
+        """
+        if self.get_local_xyz.shape[0] == 0:
+            return 0
+        selected_pts_mask = (
+            torch.max(self.get_scaling, dim=1).values > max_scale_threshold)
+        num = int(selected_pts_mask.sum().item())
+        if num == 0:
+            return 0
+
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        if self.dimension == 2:
+            stds = torch.cat([stds, 0 * torch.ones_like(stds[:, :1])], dim=-1)
+        means = torch.zeros_like(stds)
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
+        new_xyz = (torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
+                   + self.get_local_xyz[selected_pts_mask].repeat(N, 1))
+        new_scaling = self.scaling_inverse_activation(
+            self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(
+            N, 1, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
+                                    new_opacity, new_scaling, new_rotation)
+        prune_filter = torch.cat((
+            selected_pts_mask,
+            torch.zeros(N * num, device="cuda", dtype=bool)))
+        self.prune_points(prune_filter)
+        return num
+
     def densify_and_clone(self, grads, grad_threshold):
         # Extract points that satisfy the gradient condition
         grad_mask = torch.where(grads >= grad_threshold, True, False)
@@ -409,7 +450,9 @@ class GaussianModel:
                           dead_prune_min_views=1,
                           ego_prune_enabled=False,
                           ego_w2e=None,
-                          ego_bboxes=None):
+                          ego_bboxes=None,
+                          oversized_split_enabled=False,
+                          oversized_split_max_scale=1.5):
         # When skip_densify is True, we run only the pruning steps below
         # (low-opacity, bbox-escape, min_range_prune, big-points). This lets
         # us keep cleaning up after an asset has hit its point cap, instead
@@ -493,6 +536,19 @@ class GaussianModel:
             clone_num = self.densify_and_clone(mean_grads, opt.densify_grad_threshold)
             split_num = self.densify_and_split(mean_grads, opt.densify_grad_threshold)
         print(f"clone_num: {clone_num}, split_num: {split_num}")
+
+        # --- Oversized force-split (ignores gradient). ---
+        # Replaces oversized surfels with N=2 perturbed children at σ/(0.8N).
+        # Runs whether or not skip_densify is set: a Gaussian above the
+        # size threshold is a topology bug we want to fix regardless of
+        # the cap. Net +1 per split is small even at scale.
+        split_oversized_num = 0
+        if oversized_split_enabled and self.get_local_xyz.shape[0] > 0:
+            split_oversized_num = self.densify_oversized_split(
+                oversized_split_max_scale, N=2)
+            if split_oversized_num > 0:
+                print(f'Oversized force-split (σ > '
+                      f'{oversized_split_max_scale}m): {split_oversized_num}')
 
         low_opacity = (self.get_opacity < opt.thresh_opa_prune).squeeze()
         prune_mask = low_opacity
@@ -685,7 +741,7 @@ class GaussianModel:
         torch.cuda.empty_cache()
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
                 prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num,
-                prune_dead_num, prune_ego_num)
+                prune_dead_num, prune_ego_num, split_oversized_num)
 
     def add_densification_stats(self, mean_grads, update_filter):
         self.xyz_gradient_accum += torch.norm(mean_grads, dim=-1, keepdim=True)

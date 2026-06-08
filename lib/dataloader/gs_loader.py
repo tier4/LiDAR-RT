@@ -310,7 +310,7 @@ class SceneLidar(Scene):
         occupancy_grid=None,
     ):
 
-        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num, prune_dead_num, prune_ego_num = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        clone_num, split_num, prune_scale_num, prune_opacity_num, prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num, prune_dead_num, prune_ego_num, split_oversized_num = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
         sky_prune_enabled_global = bool(getattr(args.opt, "sky_prune_enabled", False))
         sky_prune_warmup_iter = int(getattr(args.opt, "sky_prune_warmup_iter", 0))
@@ -342,6 +342,10 @@ class SceneLidar(Scene):
 
         ego_prune_enabled_global = bool(getattr(args.opt, "ego_prune_enabled", False))
         ego_prune_warmup_iter = int(getattr(args.opt, "ego_prune_warmup_iter", 0))
+
+        oversized_split_enabled_global = bool(getattr(args.opt, "oversized_split_enabled", False))
+        oversized_split_warmup_iter = int(getattr(args.opt, "oversized_split_warmup_iter", 0))
+        oversized_split_max_scale = float(getattr(args.opt, "oversized_split_max_scale", 1.5))
         # Cache (world→ego rigid transforms) and the ego-frame bbox list on
         # first invocation. Ego poses are densified with 5 interpolations
         # per consecutive-frame segment so the OBB swept volume has no gaps
@@ -527,6 +531,11 @@ class SceneLidar(Scene):
                         and ego_bboxes is not None
                         and ego_bboxes.numel() > 0
                     )
+                    asset_oversized_split_enabled = (
+                        oversized_split_enabled_global
+                        and gaussians.bounding_box is None
+                        and iteration >= oversized_split_warmup_iter
+                    )
                     densify_info = gaussians.densify_and_prune(
                         args.opt, 0.005, size_threshold,
                         sensor_centers=sensor_centers,
@@ -549,6 +558,8 @@ class SceneLidar(Scene):
                         ego_prune_enabled=asset_ego_prune_enabled,
                         ego_w2e=ego_w2e if asset_ego_prune_enabled else None,
                         ego_bboxes=ego_bboxes if asset_ego_prune_enabled else None,
+                        oversized_split_enabled=asset_oversized_split_enabled,
+                        oversized_split_max_scale=oversized_split_max_scale,
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
@@ -560,6 +571,7 @@ class SceneLidar(Scene):
                     prune_occ_num += densify_info[7]
                     prune_dead_num += densify_info[8]
                     prune_ego_num += densify_info[9]
+                    split_oversized_num += densify_info[10]
 
                 if iteration % args.opt.opacity_reset_interval == 0 or (
                     args.model.white_background
@@ -586,4 +598,4 @@ class SceneLidar(Scene):
 
         return (clone_num, split_num, prune_scale_num, prune_opacity_num,
                 prune_sky_num, prune_aniso_num, prune_front_num, prune_occ_num,
-                prune_dead_num, prune_ego_num)
+                prune_dead_num, prune_ego_num, split_oversized_num)

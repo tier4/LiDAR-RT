@@ -93,6 +93,7 @@ def training(args):
         "prune_occ_sum": [],
         "prune_dead_sum": [],
         "prune_ego_sum": [],
+        "split_oversized_sum": [],
     }
     scene_id = str(args.scene_id) if isinstance(args.scene_id, int) else args.scene_id
     output_dir = os.path.join(
@@ -672,6 +673,11 @@ def training(args):
                 if log.get("prune_ego_sum")
                 else densify_info[9]
             )
+            split_oversized_sum = (
+                densify_info[10] + log["split_oversized_sum"][-1]
+                if log.get("split_oversized_sum")
+                else densify_info[10]
+            )
             log["depth_mse"].append(depth_mse)
             log["points_num"].append(points_num)
             log["clone_sum"].append(clone_sum)
@@ -684,6 +690,7 @@ def training(args):
             log.setdefault("prune_occ_sum", []).append(prune_occ_sum)
             log.setdefault("prune_dead_sum", []).append(prune_dead_sum)
             log.setdefault("prune_ego_sum", []).append(prune_ego_sum)
+            log.setdefault("split_oversized_sum", []).append(split_oversized_sum)
 
             # prepare loss stats for tensorboard record
             loss_stats = {
@@ -785,6 +792,7 @@ def training(args):
                         "train/prune_occ_sum": prune_occ_sum,
                         "train/prune_dead_sum": prune_dead_sum,
                         "train/prune_ego_sum": prune_ego_sum,
+                        "train/split_oversized_sum": split_oversized_sum,
                         # Learning rate
                         "train/lr_xyz": gaussians_assets[0].optimizer.param_groups[0]["lr"],
                     },
@@ -1402,6 +1410,10 @@ if __name__ == "__main__":
     parser.add_argument("--ego_prune_enabled", type=int, default=None,
                         help="0/1 toggle for ego-swept-volume hard prune")
     parser.add_argument("--ego_prune_warmup_iter", type=int, default=None)
+    parser.add_argument("--oversized_split_enabled", type=int, default=None,
+                        help="0/1 toggle for force-split of oversized Gaussians")
+    parser.add_argument("--oversized_split_max_scale", type=float, default=None)
+    parser.add_argument("--oversized_split_warmup_iter", type=int, default=None)
     parser.add_argument("--exp_suffix", type=str, default="",
                         help="Append to exp_name (use to keep sweep run dirs distinct)")
     launch_args = parser.parse_args()
@@ -1447,6 +1459,12 @@ if __name__ == "__main__":
         "ego_prune_enabled": (None if launch_args.ego_prune_enabled is None
                               else bool(launch_args.ego_prune_enabled)),
         "ego_prune_warmup_iter": launch_args.ego_prune_warmup_iter,
+        # Oversized force-split
+        "oversized_split_enabled":
+            (None if launch_args.oversized_split_enabled is None
+             else bool(launch_args.oversized_split_enabled)),
+        "oversized_split_max_scale": launch_args.oversized_split_max_scale,
+        "oversized_split_warmup_iter": launch_args.oversized_split_warmup_iter,
     }
     for k, v in opt_overrides.items():
         if v is not None:
