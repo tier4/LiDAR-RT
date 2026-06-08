@@ -193,22 +193,30 @@ opt:
   dead_prune_min_views: 1          # 0 observations across the cycle → kill
   dead_prune_min_contrib: 0.001    # per-frame α·T threshold to count as "observed"
 
-  # Ego-swept-volume hard prune (bg only). The ego vehicle physically
+  # Ego-swept-volume hard prune (bg only, OBB). The ego vehicle physically
   # occupied each pose's volume at that frame's moment → no static-scene
-  # geometry can exist there. Bg Gaussians whose centres land inside a
-  # vertical-axis cylinder around any train-frame ego pose are pruned.
-  # Cheaper than an OBB check and a strict superset of the typical T4
-  # vehicle envelope (1.5 m radius covers a 3 m × 1.8 m car's longest
-  # half-axis). Ego poses are densified with 5 interpolations per
-  # consecutive-frame segment so coverage is continuous along the path
-  # (ego moves ~2 m at 10 Hz; 5 interps = sub-meter step << prune radius).
+  # geometry can exist there. Bg Gaussians whose centres land inside any
+  # configured ego-frame bbox at any cached pose (base + interp) are pruned.
+  # Ego poses are densified with 5 interpolations per consecutive-frame
+  # segment so the OBB swept volume has no gaps for thin parts (mirrors
+  # are X 0.32 m thick; ego moves ~2 m / frame → 0.4 m step << thinnest dim).
+  #
+  # Bbox entries are [min_x, min_y, min_z, max_x, max_y, max_z] in EGO frame
+  # (X forward, Y left, Z up — Autoware / Tier4 vehicle convention). Default
+  # values from the Tier4 reference vehicle parameters:
+  #   rear_overhang=0.85, front_overhang=1.0, wheel_base=2.55,
+  #   wheel_tread=1.45, right/left_overhang=0.125, vehicle_height=2.5
+  # → min_x=-0.85, max_x=3.55, min_y=-0.8475, max_y=0.8475, min_z=0, max_z=2.5
+  # Plus the mirror crop from mirror.param.yaml.
   ego_prune_enabled: true
-  ego_prune_warmup_iter: 1500      # same as densify_from_iter — only prunes
-                                   # after PCD seeds had a chance to migrate
-                                   # out of the swept volume
-  ego_prune_radius: 1.5            # m, horizontal (XY)
-  ego_prune_height_above: 1.5      # m, above ego center z
-  ego_prune_height_below: 0.5      # m, below ego center z (typically ground)
+  ego_prune_warmup_iter: 1500           # same as densify_from_iter — only
+                                        # prunes after PCD seeds had a chance
+                                        # to migrate out of the swept volume
+  ego_bboxes:
+    # main body
+    - [-0.85,   -0.8475, 0.0,    3.55, 0.8475, 2.5 ]
+    # side mirrors (from mirror.param.yaml)
+    - [ 2.84,   -1.03,   0.86,   3.16, 1.03,   1.22]
 
   # Bg scale-range regulariser. Two-sided hinge loss on σ (per-axis):
   # penalty = mean( clamp(min - σ, 0) ) + mean( clamp(σ - max, 0) ).

@@ -1401,7 +1401,6 @@ if __name__ == "__main__":
     parser.add_argument("--scale_reg_max", type=float, default=None)
     parser.add_argument("--ego_prune_enabled", type=int, default=None,
                         help="0/1 toggle for ego-swept-volume hard prune")
-    parser.add_argument("--ego_prune_radius", type=float, default=None)
     parser.add_argument("--ego_prune_warmup_iter", type=int, default=None)
     parser.add_argument("--exp_suffix", type=str, default="",
                         help="Append to exp_name (use to keep sweep run dirs distinct)")
@@ -1447,7 +1446,6 @@ if __name__ == "__main__":
         # Ego-swept-volume hard prune
         "ego_prune_enabled": (None if launch_args.ego_prune_enabled is None
                               else bool(launch_args.ego_prune_enabled)),
-        "ego_prune_radius": launch_args.ego_prune_radius,
         "ego_prune_warmup_iter": launch_args.ego_prune_warmup_iter,
     }
     for k, v in opt_overrides.items():

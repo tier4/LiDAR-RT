@@ -342,39 +342,69 @@ class SceneLidar(Scene):
 
         ego_prune_enabled_global = bool(getattr(args.opt, "ego_prune_enabled", False))
         ego_prune_warmup_iter = int(getattr(args.opt, "ego_prune_warmup_iter", 0))
-        ego_prune_radius = float(getattr(args.opt, "ego_prune_radius", 1.5))
-        ego_prune_height_above = float(getattr(args.opt, "ego_prune_height_above", 1.5))
-        ego_prune_height_below = float(getattr(args.opt, "ego_prune_height_below", 0.5))
-        # Cache the dense ego-swept point set on first invocation. Points are
-        # the ego2world translations across all train frames for every sensor,
-        # plus 5 interpolated samples per consecutive-frame segment so the
-        # cylinder coverage is continuous along the path (cars move ~2 m at
-        # 10 Hz; 5 interpolations = sub-meter step is well below the prune
-        # radius default).
-        if ego_prune_enabled_global and not hasattr(self, "_ego_centers_cache"):
-            base_pts = []
+        # Cache (world→ego rigid transforms) and the ego-frame bbox list on
+        # first invocation. Ego poses are densified with 5 interpolations
+        # per consecutive-frame segment so the OBB swept volume has no gaps
+        # for thin parts (e.g. side mirrors are X 0.32 m thick, ego moves
+        # ~2 m / frame at 10 Hz → 0.4 m interp step << mirror length).
+        if ego_prune_enabled_global and not hasattr(self, "_ego_w2e_cache"):
+            base_poses = []
             for lidar in self.train_lidars.values():
                 for fid in sorted(set(lidar.train_frames) | set(lidar.eval_frames)):
                     if fid in lidar.ego2world:
-                        base_pts.append(lidar.ego2world[fid][:3, 3].cpu().numpy())
-            if base_pts:
-                base = np.stack(base_pts, axis=0)  # (M0, 3)
+                        pose = lidar.ego2world[fid]
+                        if not torch.is_tensor(pose):
+                            pose = torch.from_numpy(np.asarray(pose))
+                        base_poses.append(pose.float())
+            if base_poses:
+                base = torch.stack(base_poses, dim=0).cuda()       # (M0, 4, 4)
                 interp_n = 5
                 if base.shape[0] >= 2:
-                    a = base[:-1, None, :]
-                    b = base[1:, None, :]
-                    ts = np.linspace(0.0, 1.0, interp_n + 2)[1:-1][None, :, None]
-                    mid = (a + ts * (b - a)).reshape(-1, 3)
-                    self._ego_centers_cache = torch.from_numpy(
-                        np.concatenate([base, mid], axis=0)).float().cuda()
+                    a = base[:-1]                                    # (M0-1, 4, 4)
+                    b = base[1:]
+                    ts = torch.linspace(0.0, 1.0, interp_n + 2,
+                                         device="cuda")[1:-1]
+                    # Linear matrix interpolation: small frame deltas mean
+                    # the result is close-to-orthogonal in rotation, which
+                    # is fine for OBB inside-checks (an exact slerp would
+                    # be more correct but per-bbox error << bbox extents).
+                    interps = (a[None] + ts[:, None, None, None]
+                                          * (b[None] - a[None]))
+                    interps = interps.permute(1, 0, 2, 3).reshape(-1, 4, 4)
+                    all_poses = torch.cat([base, interps], dim=0)
                 else:
-                    self._ego_centers_cache = torch.from_numpy(base).float().cuda()
-                print(f"[ego_prune] cached {self._ego_centers_cache.shape[0]} "
-                      f"ego centers (base {base.shape[0]} + "
+                    all_poses = base
+                # World→ego rigid inverse: [R^T | -R^T t]
+                R = all_poses[:, :3, :3]                             # (M, 3, 3)
+                t = all_poses[:, :3, 3]                              # (M, 3)
+                R_inv = R.transpose(-1, -2)
+                t_inv = -(R_inv @ t.unsqueeze(-1)).squeeze(-1)
+                self._ego_w2e_cache = torch.cat(
+                    [R_inv, t_inv.unsqueeze(-1)], dim=-1)            # (M, 3, 4)
+                print(f"[ego_prune] cached {self._ego_w2e_cache.shape[0]} "
+                      f"ego poses (base {base.shape[0]} + "
                       f"{interp_n} interp/segment)")
             else:
-                self._ego_centers_cache = torch.empty(0, 3, device="cuda")
-        ego_centers = getattr(self, "_ego_centers_cache", None)
+                self._ego_w2e_cache = torch.empty(0, 3, 4, device="cuda")
+        ego_w2e = getattr(self, "_ego_w2e_cache", None)
+
+        # Parse the configured ego bboxes (list of [min_xyz, max_xyz] sextets)
+        # exactly once. Defaults below match the AWSIM / Autoware reference
+        # vehicle dims given by the user (main body + side mirrors).
+        if ego_prune_enabled_global and not hasattr(self, "_ego_bboxes_cache"):
+            ego_bboxes_cfg = getattr(args.opt, "ego_bboxes", None)
+            if ego_bboxes_cfg is None or len(ego_bboxes_cfg) == 0:
+                # Fallback: main body only, with placeholder reference dims.
+                ego_bboxes_cfg = [[-0.85, -0.8475, 0.0, 3.55, 0.8475, 2.5]]
+            arr = np.asarray(ego_bboxes_cfg, dtype=np.float32)
+            assert arr.shape[-1] == 6, (
+                f"ego_bboxes entries must be 6-element "
+                f"[min_x,min_y,min_z,max_x,max_y,max_z], got {arr.shape}")
+            self._ego_bboxes_cache = torch.from_numpy(
+                arr.reshape(-1, 2, 3)).float().cuda()                # (K, 2, 3)
+            print(f"[ego_prune] cached {self._ego_bboxes_cache.shape[0]} "
+                  f"bbox(es) in ego frame")
+        ego_bboxes = getattr(self, "_ego_bboxes_cache", None)
 
         begin_index = 0
         for gaussians in self.gaussians_assets:
@@ -492,8 +522,10 @@ class SceneLidar(Scene):
                         ego_prune_enabled_global
                         and gaussians.bounding_box is None
                         and iteration >= ego_prune_warmup_iter
-                        and ego_centers is not None
-                        and ego_centers.numel() > 0
+                        and ego_w2e is not None
+                        and ego_w2e.numel() > 0
+                        and ego_bboxes is not None
+                        and ego_bboxes.numel() > 0
                     )
                     densify_info = gaussians.densify_and_prune(
                         args.opt, 0.005, size_threshold,
@@ -515,10 +547,8 @@ class SceneLidar(Scene):
                         dead_prune_enabled=asset_dead_prune_enabled,
                         dead_prune_min_views=dead_prune_min_views,
                         ego_prune_enabled=asset_ego_prune_enabled,
-                        ego_centers=ego_centers if asset_ego_prune_enabled else None,
-                        ego_prune_radius=ego_prune_radius,
-                        ego_prune_height_above=ego_prune_height_above,
-                        ego_prune_height_below=ego_prune_height_below,
+                        ego_w2e=ego_w2e if asset_ego_prune_enabled else None,
+                        ego_bboxes=ego_bboxes if asset_ego_prune_enabled else None,
                     )
                     clone_num += densify_info[0]
                     split_num += densify_info[1]
