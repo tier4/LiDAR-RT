@@ -27,7 +27,8 @@ PROJECT="LiDAR-RT-debug"
 usage() {
     cat <<EOF
 Usage:
-  $0 --create                                       Create a new sweep, print its SWEEP_ID
+  $0 --create [<sweep_yaml>]                        Create a new sweep, print its SWEEP_ID
+                                                    Default config: configs/sweep_t4_20k.yaml
   $0 <SWEEP_ID> [--gpu N] [--count N] [--parallel N] Run an agent for the given sweep
   $0 --resume <SWEEP_ID> [--gpu N] [--parallel N]   Alias for the run-agent form
 
@@ -43,6 +44,15 @@ if [ $# -lt 1 ]; then
 fi
 
 if [ "$1" = "--create" ]; then
+    shift
+    # Optional positional override: ./run_sweep_t4.sh --create configs/foo.yaml
+    if [ $# -ge 1 ] && [ -f "$1" ]; then
+        SWEEP_CONFIG="$1"
+    elif [ $# -ge 1 ]; then
+        echo "Error: config file not found: $1" >&2
+        exit 1
+    fi
+    echo "Using sweep config: ${SWEEP_CONFIG}"
     wandb sweep \
         --project "${WANDB_PROJECT:-${PROJECT}}" \
         --entity "${WANDB_ENTITY:-${ENTITY}}" \

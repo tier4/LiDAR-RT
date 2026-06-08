@@ -1,0 +1,86 @@
+# Wandb sweep config: 2D grid over (lambda_front_acc, edge_loss_boost).
+#
+# Motivation
+# ----------
+# Edge-band analysis on ckpt_it_21000 (output/ghost_edge_21000/) showed
+# off-edge MAE dropped to 0.35m (very good) but the edge pixel itself
+# still sits at 3.79m MAE. Root cause: bg-model Gaussians along an edge
+# ray don't fully occlude one another (stack_loss plateaued at 0.24 ⇒
+# avg ~3.4 contributors per edge pixel). The fix targets the alpha
+# distribution rather than the contributor count:
+#   - lambda_front_acc penalises α accumulated strictly in front of the
+#     GT hit (or to infinity for sky rays), pushing the front-most
+#     Gaussian's α toward 1 so back ones can't bleed through.
+#   - edge_loss_boost multiplies depth_l1 AND front_acc on edge pixels
+#     (final = 1 + boost). Tuned together because front_acc's effective
+#     weight at edges = lambda_front_acc * (1 + edge_loss_boost).
+#
+# Grid (4 × 3 = 12 runs):
+#   lambda_front_acc: 0.05 (half-current), 0.10 (current), 0.20 (2x), 0.30 (3x)
+#   edge_loss_boost : 0.2 (sub), 0.5 (current), 1.0 (2x)
+#
+# Wall-clock estimate
+# -------------------
+# 20K iter ≈ 30-60 min per run on a single 24GB GPU; with --parallel 3
+# (sweep agent's built-in concurrent process flag in run_sweep_t4.sh)
+# total wall-clock is ≈ 2-4 hours.
+#
+# Usage
+# -----
+#   wandb sweep --project LiDAR-RT-debug \
+#               --entity advanced-technology-department \
+#               configs/sweep_front_acc_edge_boost.yaml
+#   # → prints SWEEP_ID
+#
+#   ./run_sweep_t4.sh <SWEEP_ID> --parallel 3
+#
+# Note: run_sweep_t4.sh's --create flag is hardcoded to the
+# sweep_t4_20k.yaml path. For this sweep, create it manually with the
+# wandb CLI above, then the agent-launch form ('./run_sweep_t4.sh
+# <SWEEP_ID>') works unchanged.
+
+program: train.py
+# Grid: 12 cells is small enough to enumerate exhaustively, and
+# response-surface visualisation (front_acc on x, boost on y, phantom
+# on z) is cleaner with grid than Bayes.
+method: grid
+
+metric:
+  # Direct phantom-count metric — matches the failure mode we're
+  # attacking (over-bleed at edges = phantoms in front of real
+  # surfaces, picked up by both front_acc loss and this eval metric).
+  name: eval/total_phantom_pixels
+  goal: minimize
+
+run_cap: 12
+
+command:
+  # See sweep_t4_20k.yaml for why we hard-code the venv interpreter
+  # path: wandb agent normally calls `/usr/bin/env python` which
+  # doesn't exist on this host.
+  - ${env}
+  - .venv/bin/python
+  - ${program}
+  - -ec
+  - configs/t4/exp_t4.yaml
+  - -dc
+  - configs/t4/dynamic/example.yaml
+  - -s
+  - /home/masaya/.webauto/data/data/annotation_dataset/433a2328-a5a6-4790-87d3-59e930ac7020/2
+  - --iterations=20000
+  - --disable_refine
+  - ${args}
+
+parameters:
+  lambda_front_acc:
+    values: [0.05, 0.10, 0.20, 0.30]
+  edge_loss_boost:
+    values: [0.2, 0.5, 1.0]
+
+# Hyperband culls runs whose phantom_pixels stays high after the first
+# eval point past iter 15K. Matches the 13K→15K phantom-drop window
+# observed in earlier runs.
+early_terminate:
+  type: hyperband
+  min_iter: 15000
+  eta: 2
