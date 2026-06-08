@@ -202,12 +202,18 @@ opt:
   # are X 0.32 m thick; ego moves ~2 m / frame → 0.4 m step << thinnest dim).
   #
   # Bbox entries are [min_x, min_y, min_z, max_x, max_y, max_z] in EGO frame
-  # (X forward, Y left, Z up — Autoware / Tier4 vehicle convention). Default
-  # values from the Tier4 reference vehicle parameters:
-  #   rear_overhang=0.85, front_overhang=1.0, wheel_base=2.55,
-  #   wheel_tread=1.45, right/left_overhang=0.125, vehicle_height=2.5
-  # → min_x=-0.85, max_x=3.55, min_y=-0.8475, max_y=0.8475, min_z=0, max_z=2.5
-  # Plus the mirror crop from mirror.param.yaml.
+  # (X forward, Y left, Z up — Autoware / Tier4 vehicle convention).
+  # Default values from the JpnTaxi description in pilot-auto.xx1
+  # (src/description/vehicle/jpntaxi_description/.../config/):
+  #   vehicle_info.param.yaml:
+  #     wheel_base=2.75, wheel_tread=1.485, front_overhang=0.8,
+  #     rear_overhang=0.85, left/right_overhang=0.105, vehicle_height=2.5
+  #   →  min_x = -rear_overhang                       = -0.85
+  #      max_x = front_overhang + wheel_base          =  3.55
+  #      min_y = -(wheel_tread/2 + right_overhang)    = -0.8475
+  #      max_y =  (wheel_tread/2 + left_overhang)     =  0.8475
+  #      min_z = 0, max_z = vehicle_height            =  2.5
+  #   mirror.param.yaml: min/max longitudinal/lateral/height offsets used verbatim.
   ego_prune_enabled: true
   ego_prune_warmup_iter: 1500           # same as densify_from_iter — only
                                         # prunes after PCD seeds had a chance
