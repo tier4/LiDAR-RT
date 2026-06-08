@@ -443,6 +443,84 @@ def main():
     except Exception as e:
         print(f"[Gaussians] bg viz skipped: {type(e).__name__}: {e}", flush=True)
 
+    # --- Ego-prune swept-volume visualisation ---
+    # Renders the ego OBB(s) at every cached pose (base + interpolated) as
+    # translucent red boxes under world/ego_prune. This is the volume where
+    # bg Gaussians should not exist (and are hard-pruned every densify
+    # cycle by the ego-prune path in densify_and_prune). Useful for
+    # eyeballing whether a remaining bg ellipsoid sits inside the swept
+    # volume — should be 0 after iter 1600.
+    try:
+        ego_prune_enabled_cfg = bool(getattr(args.opt, "ego_prune_enabled", False))
+        if ego_prune_enabled_cfg:
+            # Mirror the (base + 5 interp/segment) cache from gs_loader.optimize.
+            base_poses = []
+            for sname, lidar in lidars.items():
+                for fid in sorted(set(lidar.train_frames) | set(lidar.eval_frames)):
+                    if fid in lidar.ego2world:
+                        pose = lidar.ego2world[fid]
+                        if not torch.is_tensor(pose):
+                            pose = torch.from_numpy(np.asarray(pose))
+                        base_poses.append(pose.float())
+            if base_poses:
+                base = torch.stack(base_poses, dim=0)  # (M0, 4, 4) on CPU
+                interp_n = 5
+                if base.shape[0] >= 2:
+                    a = base[:-1]
+                    b = base[1:]
+                    ts = torch.linspace(0.0, 1.0, interp_n + 2)[1:-1]
+                    interps = (a[None] + ts[:, None, None, None]
+                                          * (b[None] - a[None]))
+                    interps = interps.permute(1, 0, 2, 3).reshape(-1, 4, 4)
+                    all_poses = torch.cat([base, interps], dim=0)
+                else:
+                    all_poses = base
+                # Bboxes from config: list of [min_x..max_z] in ego frame
+                ego_bboxes_cfg = getattr(args.opt, "ego_bboxes", None)
+                if not ego_bboxes_cfg:
+                    ego_bboxes_cfg = [[-0.85, -0.8475, 0.0, 3.55, 0.8475, 2.5]]
+                bb_arr = np.asarray(ego_bboxes_cfg, dtype=np.float32).reshape(
+                    -1, 2, 3)  # (K, 2, 3)
+                # Per-bbox ego-frame center / full-size (rerun's Boxes3D uses
+                # full sizes, not half-sizes — matches how world/bboxes logs).
+                ego_centers = (bb_arr[:, 0, :] + bb_arr[:, 1, :]) / 2.0   # (K, 3)
+                ego_sizes = bb_arr[:, 1, :] - bb_arr[:, 0, :]              # (K, 3)
+                # Transform each (pose, bbox) into world.
+                R = all_poses[:, :3, :3].numpy()   # (M, 3, 3)
+                t = all_poses[:, :3, 3].numpy()    # (M, 3)
+                M = R.shape[0]
+                K = ego_centers.shape[0]
+                # world_center[m, k] = R[m] @ ego_centers[k] + t[m]
+                world_centers = (R[:, None, :, :] @
+                                  ego_centers[None, :, :, None]).squeeze(-1) \
+                                + t[:, None, :]                            # (M, K, 3)
+                world_centers = (world_centers.reshape(-1, 3).astype(np.float64)
+                                  - origin_offset)                          # (M*K, 3)
+                sizes = np.tile(ego_sizes[None, :, :], (M, 1, 1)).reshape(-1, 3)
+                # Quaternion (xyzw) from each rotation matrix.
+                rot_t = torch.from_numpy(R).float()
+                # Manual matrix → quaternion (wxyz) then reorder.
+                tr = rot_t[..., 0, 0] + rot_t[..., 1, 1] + rot_t[..., 2, 2]
+                qw = torch.sqrt(torch.clamp(1 + tr, min=0)) / 2
+                qx = (rot_t[..., 2, 1] - rot_t[..., 1, 2]) / (4 * qw.clamp_min(1e-8))
+                qy = (rot_t[..., 0, 2] - rot_t[..., 2, 0]) / (4 * qw.clamp_min(1e-8))
+                qz = (rot_t[..., 1, 0] - rot_t[..., 0, 1]) / (4 * qw.clamp_min(1e-8))
+                quats_xyzw_pose = torch.stack([qx, qy, qz, qw], dim=-1).numpy()  # (M, 4)
+                quats = np.tile(quats_xyzw_pose[:, None, :],
+                                 (1, K, 1)).reshape(-1, 4)
+                # Translucent red — RGBA alpha 40/255 so dense overlaps stay
+                # readable without occluding the GT/rendered point clouds.
+                colors = np.tile(np.array([255, 0, 0, 40], dtype=np.uint8),
+                                  (world_centers.shape[0], 1))
+                rr.log("world/ego_prune/swept_volume",
+                       rr.Boxes3D(centers=world_centers, sizes=sizes,
+                                  quaternions=quats, colors=colors),
+                       static=True)
+                print(f"[ego_prune viz] logged {M} poses × {K} bbox(es) "
+                      f"= {M*K} boxes", flush=True)
+    except Exception as e:
+        print(f"[ego_prune viz] skipped: {type(e).__name__}: {e}", flush=True)
+
     # Per-sensor colors for 3D points
     SENSOR_COLORS = [
         [255, 255, 255],  # white
