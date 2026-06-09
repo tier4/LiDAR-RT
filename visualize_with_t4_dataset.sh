@@ -97,37 +97,49 @@ read_yaml_value() {
     "${PYTHON}" -c "import yaml; d=yaml.safe_load(open('$1')); print(d.get('$2',''))"
 }
 
-MODEL_DIR=$(read_yaml_value "${EXP_CONFIG}" model_dir)
-TASK_NAME=$(read_yaml_value "${EXP_CONFIG}" task_name)
-EXP_NAME=$(read_yaml_value "${EXP_CONFIG}" exp_name)
-SCENE_ID=$(read_yaml_value "${DATA_CONFIG}" scene_id)
-OUTPUT_DIR="${MODEL_DIR}/${TASK_NAME}/${EXP_NAME}/scene_${SCENE_ID}"
-MODELS_DIR="${OUTPUT_DIR}/models"
-
-if [ ! -d "${MODELS_DIR}" ]; then
-    echo "Error: models dir not found: ${MODELS_DIR}" >&2
-    exit 1
-fi
-
 # Resolve checkpoint
 if [ -n "${CKPT_OVERRIDE}" ]; then
+    # Explicit -c path wins. Derive MODELS_DIR / OUTPUT_DIR from it so
+    # UNet lookup and .rrd output land next to the checkpoint, not
+    # under the config-derived default exp_name path.
     CKPT="${CKPT_OVERRIDE}"
-elif [ -n "${ITER}" ]; then
-    CKPT="${MODELS_DIR}/ckpt_it_${ITER}.pth"
     if [ ! -f "${CKPT}" ]; then
-        CKPT="${MODELS_DIR}/model_it_${ITER}.pth"
+        echo "Error: -c checkpoint not found: ${CKPT}" >&2
+        exit 1
     fi
-    if [ ! -f "${CKPT}" ]; then
-        CKPT="${MODELS_DIR}/ckpt_it_${ITER}_good.pth"
-    fi
+    MODELS_DIR="$(cd "$(dirname "${CKPT}")" && pwd)"
+    OUTPUT_DIR="$(dirname "${MODELS_DIR}")"
 else
-    # Prefer the "_good" checkpoint; fall back to the latest model_it_*.pth or ckpt_it_*.pth
-    CKPT=$(ls -1 "${MODELS_DIR}"/ckpt_it_*_good.pth 2>/dev/null | sort -V | tail -1 || true)
-    if [ -z "${CKPT}" ]; then
-        CKPT=$(ls -1 "${MODELS_DIR}"/ckpt_it_*.pth 2>/dev/null | sort -V | tail -1 || true)
+    # Config-derived path: <model_dir>/<task_name>/<exp_name>/scene_<scene_id>/models
+    MODEL_DIR=$(read_yaml_value "${EXP_CONFIG}" model_dir)
+    TASK_NAME=$(read_yaml_value "${EXP_CONFIG}" task_name)
+    EXP_NAME=$(read_yaml_value "${EXP_CONFIG}" exp_name)
+    SCENE_ID=$(read_yaml_value "${DATA_CONFIG}" scene_id)
+    OUTPUT_DIR="${MODEL_DIR}/${TASK_NAME}/${EXP_NAME}/scene_${SCENE_ID}"
+    MODELS_DIR="${OUTPUT_DIR}/models"
+
+    if [ ! -d "${MODELS_DIR}" ]; then
+        echo "Error: models dir not found: ${MODELS_DIR}" >&2
+        exit 1
     fi
-    if [ -z "${CKPT}" ]; then
-        CKPT=$(ls -1 "${MODELS_DIR}"/model_it_*.pth 2>/dev/null | sort -V | tail -1 || true)
+
+    if [ -n "${ITER}" ]; then
+        CKPT="${MODELS_DIR}/ckpt_it_${ITER}.pth"
+        if [ ! -f "${CKPT}" ]; then
+            CKPT="${MODELS_DIR}/model_it_${ITER}.pth"
+        fi
+        if [ ! -f "${CKPT}" ]; then
+            CKPT="${MODELS_DIR}/ckpt_it_${ITER}_good.pth"
+        fi
+    else
+        # Prefer the "_good" checkpoint; fall back to the latest model_it_*.pth or ckpt_it_*.pth
+        CKPT=$(ls -1 "${MODELS_DIR}"/ckpt_it_*_good.pth 2>/dev/null | sort -V | tail -1 || true)
+        if [ -z "${CKPT}" ]; then
+            CKPT=$(ls -1 "${MODELS_DIR}"/ckpt_it_*.pth 2>/dev/null | sort -V | tail -1 || true)
+        fi
+        if [ -z "${CKPT}" ]; then
+            CKPT=$(ls -1 "${MODELS_DIR}"/model_it_*.pth 2>/dev/null | sort -V | tail -1 || true)
+        fi
     fi
 fi
 
