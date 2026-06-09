@@ -1,0 +1,13 @@
+parent_config: "configs/t4/t4_base.yaml"
+source_dir: "data/t4/dynamic/1"
+
+# Original frame window (before the 2026-06-09 +100 frame shift in
+# example.yaml). Kept around so the legacy scene_t4d1 checkpoints
+# (under output/t4_tuned/test/scene_t4d1/) remain visualisable
+# without editing example.yaml back. Pair with the train/vis scripts
+# via `-dc configs/t4/dynamic/example_orig.yaml`.
+frame_length: [0, 49]
+eval_frames: [10, 20, 30, 40]
+
+scene_id: t4d1
+dynamic: True

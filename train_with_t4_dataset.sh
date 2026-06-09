@@ -7,10 +7,11 @@ EXP_CONFIG="configs/t4/exp_t4.yaml"
 DATA_CONFIG="configs/t4/dynamic/example.yaml"
 
 usage() {
-    echo "Usage: $0 [-g <gpu-id>] [--no-vis] [--vis-type <train|test|all>] <dataset-uuid> [-- extra train.py args...]"
+    echo "Usage: $0 [-g <gpu-id>] [-dc <data-config>] [--no-vis] [--vis-type <train|test|all>] <dataset-uuid> [-- extra train.py args...]"
     echo ""
     echo "Options:"
     echo "  -g, --gpu <id>          CUDA device ID to use (default: 0)"
+    echo "  -dc, --data-config <p>  Data config yaml (default: ${DATA_CONFIG})"
     echo "      --no-vis            Skip rerun visualization after training"
     echo "      --vis-type <type>   Frames to render: train, test, or all (default: all)"
     echo ""
@@ -18,6 +19,7 @@ usage() {
     echo "  $0 835afe23-ff50-4883-a0b2-421e101a124b"
     echo "  $0 -g 1 835afe23-ff50-4883-a0b2-421e101a124b"
     echo "  $0 -g 1 --no-vis 835afe23-ff50-4883-a0b2-421e101a124b -- -m output/model.pth"
+    echo "  $0 -dc configs/t4/dynamic/other_scene.yaml 835afe23-..."
     exit 1
 }
 
@@ -33,6 +35,14 @@ while [ $# -gt 0 ]; do
                 usage
             fi
             GPU_ID="$2"
+            shift 2
+            ;;
+        -dc|--data-config)
+            if [ $# -lt 2 ]; then
+                echo "Error: $1 requires a value"
+                usage
+            fi
+            DATA_CONFIG="$2"
             shift 2
             ;;
         --no-vis)
@@ -62,6 +72,8 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+[ -f "${DATA_CONFIG}" ] || { echo "Error: data config not found: ${DATA_CONFIG}"; exit 1; }
 
 if [ $# -lt 1 ]; then
     usage

@@ -7,12 +7,13 @@ EXP_CONFIG="configs/t4/exp_t4.yaml"
 DATA_CONFIG="configs/t4/dynamic/example.yaml"
 
 usage() {
-    echo "Usage: $0 [-g <gpu-id>] [-i <iteration>] [-c <ckpt-path>] [--vis-type <train|test|all>] <dataset-uuid>"
+    echo "Usage: $0 [-g <gpu-id>] [-i <iteration>] [-c <ckpt-path>] [-dc <data-config>] [--vis-type <train|test|all>] <dataset-uuid>"
     echo ""
     echo "Options:"
     echo "  -g, --gpu <id>          CUDA device ID to use (default: 0)"
     echo "  -i, --iter <iter>       Use ckpt_it_<iter>.pth or model_it_<iter>.pth"
     echo "  -c, --ckpt <path>       Explicit checkpoint path (overrides -i)"
+    echo "  -dc, --data-config <p>  Data config yaml (default: ${DATA_CONFIG})"
     echo "      --vis-type <type>   Frames to render: train, test, or all (default: all)"
     echo ""
     echo "If neither -i nor -c is given, picks the latest checkpoint found in models/."
@@ -21,6 +22,7 @@ usage() {
     echo "  $0 433a2328-a5a6-4790-87d3-59e930ac7020"
     echo "  $0 -i 8000 433a2328-a5a6-4790-87d3-59e930ac7020"
     echo "  $0 -g 1 -c output/.../models/ckpt_it_8000.pth 433a2328-a5a6-4790-87d3-59e930ac7020"
+    echo "  $0 -dc configs/t4/dynamic/other_scene.yaml 433a2328-..."
     exit 1
 }
 
@@ -46,6 +48,11 @@ while [ $# -gt 0 ]; do
             CKPT_OVERRIDE="$2"
             shift 2
             ;;
+        -dc|--data-config)
+            [ $# -lt 2 ] && { echo "Error: $1 requires a value"; usage; }
+            DATA_CONFIG="$2"
+            shift 2
+            ;;
         --vis-type)
             [ $# -lt 2 ] && { echo "Error: $1 requires a value"; usage; }
             VIS_TYPE="$2"
@@ -63,6 +70,8 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+[ -f "${DATA_CONFIG}" ] || { echo "Error: data config not found: ${DATA_CONFIG}"; exit 1; }
 
 [ $# -lt 1 ] && usage
 UUID="$1"
