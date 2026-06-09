@@ -119,17 +119,28 @@ opt:
   # discussion in commit 9ec9fc8). Targeting max_depth pushes phantoms
   # in the right direction (away). Clamp prevents one far-off rogue
   # phantom from dominating the gradient.
-  lambda_no_return_l1: 0.1    # Dry-run on iter-25K ckpt showed mean clamped
-                              # err saturates near the cap (~19.9 m) initially
-                              # because phantoms sit at ~45-55m vs target 200m.
-                              # At λ=0.5 the contribution was ~10/iter,
-                              # dominating depth_l1 (~1.7). 0.1 gives ~2/iter
-                              # = same order as depth_l1, decaying naturally
-                              # toward 0 as phantoms migrate to max_depth.
-                              # Sweep candidate: [0.05, 0.1, 0.2, 0.5].
-  no_return_l1_max_err: 20.0  # Huber-style cap. A phantom at rd=5m with
-                              # target=200m has raw err=195m; clamping to
-                              # 20m keeps the gradient bounded.
+  # Clamp range expanded 2026-06-09 after ablation (run sbegy5u6 vs
+  # 6zzsvfxz, both 30K iter). Original λ=0.1, max_err=20m gave +1.6%
+  # eval/depth_mae over the λ=0 baseline but `train/no_return_l1_loss`
+  # stayed at 1.93 for the entire 30K iter run — i.e. the loss never
+  # escaped clamp saturation (mean phantom rd_depth ~45-55m << target
+  # 200m, raw err ~145m clamped to 20m). Two side-effects of the
+  # saturation:
+  #   1. Loss value is uninformative (≈ λ × max_err always)
+  #   2. Gradient within the clamp range is constant → no "kill the
+  #      far phantom first" preference (all sky-side hits get equal α
+  #      pressure, sometimes pushing more weight toward viz_min_depth
+  #      close-range phantoms — phantom_pixels +1.3% in MAIN vs ABL).
+  # Fix: raise max_err to 100m so the typical phantom depth band
+  # (30-100m) sits in the linear region. To keep total penalty
+  # magnitude unchanged, lower λ by the same factor:
+  #   OLD: λ=0.1, max_err=20  → λ × max_err = 2.0
+  #   NEW: λ=0.02, max_err=100 → λ × max_err = 2.0
+  # In the linear region the gradient becomes distance-weighted
+  # (kills far phantoms preferentially) — same desirable property as
+  # lambda_sky but without sky_loss's close-range "safe zone".
+  lambda_no_return_l1: 0.02
+  no_return_l1_max_err: 100.0
   lambda_intensity_l1: 0.1    # was 0.4 (originally 0.85). Geometry is the
                               # primary task, intensity is auxiliary.
   lambda_intensity_l2: 0.0
