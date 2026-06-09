@@ -4,5 +4,5 @@ source_dir: "data/t4/dynamic/1"
 frame_length: [100, 149]
 eval_frames: [110, 120, 130, 140]
 
-scene_id: t4d1
+scene_id: t4d1_shift100
 dynamic: True
